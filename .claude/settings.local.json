@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/c/Users/cestevez/OneDrive - jicohen.com/Proyectos/Knapp Prototipos/wcspro1/.pro1/Scripts/python\" \"/c/Users/cestevez/OneDrive - jicohen.com/Proyectos/Knapp Prototipos/wcspro1/client_gui.py\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8080)",
+      "Bash(pkill -f client_gui.py)",
+      "Bash(\"/c/Users/cestevez/OneDrive - jicohen.com/Proyectos/Knapp Prototipos/wcspro1/.pro1/Scripts/python\" \"/c/Users/cestevez/OneDrive - jicohen.com/Proyectos/Knapp Prototipos/wcspro1/client/client_gui.py\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8081)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8082)",
+      "Bash(pkill -9 -f client_gui.py)",
+      "Bash(python -m py_compile client/client_gui.py)"
+    ]
+  }
+}

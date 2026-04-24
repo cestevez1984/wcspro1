@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""COHEN Guatemala – KiSoft One HIS Client Simulator"""
+
+import json
+from nicegui import ui
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+CLIENTS = ['DEFAULT', 'A1201', 'A1301', 'A1401', 'A3601', 'A4101', 'A5101', '6111']
+CLIENT_LABELS = {
+    'DEFAULT': 'DEFAULT',
+    'A1201':   'A1201 – JILOH',
+    'A1301':   'A1301 – AJISA',
+    'A1401':   'A1401 – ALISE',
+    'A3601':   'A3601 – ELECTRON SERVICES',
+    'A4101':   'A4101 – LE Recurso Corporativo',
+    'A5101':   'A5101 – SOLIN',
+    '6111':    '6111 – YVES ROCHER',
+}
+CLIENT_SELECT = {k: CLIENT_LABELS[k] for k in CLIENTS}
+
+STATIONS   = ['001', '002', '003', '004', '010', '011', '061', '065', '199']
+CHARS      = ['ROBOT_TREATABLE', 'COOLING_REQUIRED', 'CONTROLLED', 'UNMARKED']
+PROPS      = [('01', 'Lot required'), ('02', 'Expiry required'), ('03', 'Serial required')]
+DAY_SELECT = {'': '(none)', 'MON': 'MON', 'TUE': 'TUE', 'WED': 'WED',
+              'THU': 'THU', 'FRI': 'FRI', 'SAT': 'SAT', 'SUN': 'SUN'}
+RAMPS      = [f'{i:05d}' for i in range(1, 11)] + [f'{i:05d}' for i in range(21, 26)]
+
+TAB_MAP = {'Articles (14N)': 'article', 'Partners (15N)': 'partner', 'Routes (16N)': 'route'}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Protocol helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pad_alpha(value, length: int) -> str:
+    return str(value or '').ljust(length)[:length]
+
+def pad_num(value, length: int) -> str:
+    try:
+        return str(int(value or 0)).zfill(length)[:length]
+    except (ValueError, TypeError):
+        return '0' * length
+
+def encode_packet(data: str) -> bytes:
+    body  = data.encode('utf-8')
+    count = 5 + len(body)
+    return b'\n' + f'{count:05d}'.encode() + body + b'\r'
+
+def packet_display(data: str) -> str:
+    raw      = encode_packet(data)
+    count_str = raw[1:6].decode()
+    hex_full  = ' '.join(f'{b:02X}' for b in raw)
+    return (
+        f'─── Record string ───────────────────────────────────\n'
+        f'{data}\n\n'
+        f'─── Frame breakdown ─────────────────────────────────\n'
+        f'  LF    : 0A\n'
+        f'  COUNT : {count_str}  (= 5 + {len(raw) - 7} data bytes)\n'
+        f'  DATA  : {len(raw) - 7} bytes\n'
+        f'  CR    : 0D\n\n'
+        f'─── Full packet (hex) ───────────────────────────────\n'
+        f'{hex_full}'
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Message builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_14N(s: dict) -> str:
+    r  = '14N'
+    r += '03' + pad_alpha(s.get('station', '001'), 3)
+    r += 'L'
+    r += '16' + pad_alpha(s.get('client', 'DEFAULT'), 16)
+    r += '12' + pad_alpha(s.get('article_number', ''), 12)
+    r += '04' + pad_num(s.get('pack_size', 0), 4)
+    r += '00'
+    r += 'Y' + '02' + pad_num(s.get('ejection_number', 10), 2)
+    r += 'M' + '04' + pad_num(s.get('max_quantity', 0), 4)
+    r += 'D'
+    r += '04' + pad_num(s.get('length_mm', 0), 4)
+    r += '04' + pad_num(s.get('width_mm', 0), 4)
+    r += '04' + pad_num(s.get('height_mm', 0), 4)
+    r += '00'
+    r += 'G' + '06' + pad_num(s.get('weight', 1), 6)
+    barcodes = [b for b in s.get('barcodes', []) if str(b).strip()]
+    r += 'B' + f'{len(barcodes):02d}'
+    for bc in barcodes:
+        r += '20' + pad_alpha(bc, 20)
+    r += 'K'
+    r += '40' + pad_alpha(s.get('article_name', ''), 40)
+    r += '12' + pad_alpha(s.get('geocode', ''), 12)
+    r += 'S'
+    r += '04' + pad_num(s.get('min_stock', 0), 4)
+    r += '04' + pad_num(s.get('max_stock', 0), 4)
+    selected_chars = [c for c in CHARS if s.get(f'char_{c}', False)]
+    r += 'F' + f'{len(selected_chars):02d}'
+    for c in selected_chars:
+        r += '17' + pad_alpha(c, 17)
+    selected_props = [p for p, _ in PROPS if s.get(f'prop_{p}', False)]
+    r += 'E' + f'{len(selected_props):02d}'
+    for p in selected_props:
+        r += '02' + p
+    r += 'T'
+    r += '03' + pad_alpha(s.get('repl_station', ''), 3)
+    r += '12' + pad_alpha(s.get('repl_geocode', ''), 12)
+    return r
+
+
+def build_15N(s: dict) -> str:
+    r  = '15N'
+    r += '16' + pad_alpha(s.get('client', 'DEFAULT'), 16)
+    r += '12' + pad_alpha(s.get('partner_number', ''), 12)
+    r += 'C' + '30' + pad_alpha(s.get('company', ''), 30)
+    r += 'A' + '30' + pad_alpha(s.get('treatment', ''), 30)
+    r += 'N' + '30' + pad_alpha(s.get('last_name', ''), 30)
+    r += 'M' + '30' + pad_alpha(s.get('first_name', ''), 30)
+    r += 'S' + '30' + pad_alpha(s.get('street', ''), 30)
+    r += 'P' + '30' + pad_alpha(s.get('city', ''), 30)
+    r += 'Z' + '06' + pad_alpha(s.get('zip_code', ''), 6)
+    r += 'R' + '30' + pad_alpha(s.get('region', ''), 30)
+    r += 'O' + '02' + pad_alpha(s.get('country_code', ''), 2)
+    r += 'E' + '30' + pad_alpha(s.get('email', ''), 30)
+    r += 'L' + '30' + pad_alpha(s.get('phone', ''), 30)
+    return r
+
+
+def build_16N(s: dict) -> str:
+    r   = '16N'
+    r  += '16' + pad_alpha(s.get('client', 'DEFAULT'), 16)
+    r  += '08' + pad_alpha(s.get('route_number', ''), 8)
+    day = s.get('day_of_week', '')
+    r  += 'Z'
+    r  += '06' + '06' + ('03' if day else '00')
+    r  += pad_alpha(s.get('departure_time', '000000'), 6)
+    r  += pad_alpha(s.get('availability_time', '000000'), 6)
+    if day:
+        r += pad_alpha(day, 3)
+    ramps = [rp for rp in s.get('ramps', []) if rp]
+    r += 'R' + f'{len(ramps):02d}' + '05'
+    for rp in ramps:
+        r += pad_alpha(rp, 5)
+    return r
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Application state
+# ─────────────────────────────────────────────────────────────────────────────
+
+art: dict = {'station': '001', 'client': 'DEFAULT', 'barcodes': []}
+prt: dict = {'client': 'DEFAULT'}
+rte: dict = {'client': 'DEFAULT', 'day_of_week': '', 'ramps': []}
+
+ctx: dict = {'tab': 'article', 'preview_el': None}
+
+# Pre-compute initial preview text (before layout, no event loop needed)
+try:
+    _initial_preview = packet_display(build_14N(art))
+except Exception as _e:
+    _initial_preview = str(_e)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Preview refresh
+# ─────────────────────────────────────────────────────────────────────────────
+
+def refresh_preview() -> None:
+    try:
+        tab = ctx['tab']
+        if tab == 'article':
+            data = build_14N(art)
+        elif tab == 'partner':
+            data = build_15N(prt)
+        else:
+            data = build_16N(rte)
+        text = packet_display(data)
+    except Exception as exc:
+        text = f'Error building message:\n{exc}'
+    el = ctx['preview_el']
+    if el is not None:
+        el.value = text
+        el.update()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bound widget helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def bind_input(label: str, state: dict, key: str, **kw):
+    def _on(e):
+        state[key] = e.value
+        refresh_preview()
+    return ui.input(label, value=state.get(key, ''), on_change=_on, **kw)
+
+def bind_number(label: str, state: dict, key: str, **kw):
+    def _on(e):
+        state[key] = e.value
+        refresh_preview()
+    return ui.number(label, value=state.get(key, 0), on_change=_on, **kw)
+
+def bind_select(label: str, options, state: dict, key: str, **kw):
+    def _on(e):
+        state[key] = e.value
+        refresh_preview()
+    return ui.select(options, label=label, value=state.get(key), on_change=_on, **kw)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dynamic lists (refreshable)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@ui.refreshable
+def barcode_list() -> None:
+    for i, bc in enumerate(art['barcodes']):
+        with ui.row().classes('items-center w-full gap-2'):
+            def _ch(e, idx=i):
+                art['barcodes'][idx] = e.value
+                refresh_preview()
+            ui.input(f'Barcode {i + 1}', value=bc, on_change=_ch).classes('flex-1')
+            def _del(idx=i):
+                art['barcodes'].pop(idx)
+                barcode_list.refresh()
+                refresh_preview()
+            ui.button(icon='delete', on_click=_del).props('flat round dense color=negative')
+    if not art['barcodes']:
+        ui.label('No barcodes added').classes('text-grey-6 text-caption')
+
+def add_barcode() -> None:
+    art['barcodes'].append('')
+    barcode_list.refresh()
+    refresh_preview()
+
+
+@ui.refreshable
+def ramp_list() -> None:
+    for i, rp in enumerate(rte['ramps']):
+        with ui.row().classes('items-center gap-2'):
+            def _ch(e, idx=i):
+                rte['ramps'][idx] = e.value
+                refresh_preview()
+            ui.select(RAMPS, value=rp, on_change=_ch).classes('w-52')
+            def _del(idx=i):
+                rte['ramps'].pop(idx)
+                ramp_list.refresh()
+                refresh_preview()
+            ui.button(icon='delete', on_click=_del).props('flat round dense color=negative')
+    if not rte['ramps']:
+        ui.label('No ramps added').classes('text-grey-6 text-caption')
+
+def add_ramp() -> None:
+    if len(rte['ramps']) < 20:
+        rte['ramps'].append(RAMPS[0])
+        ramp_list.refresh()
+        refresh_preview()
+
+
+def preview_area() -> None:
+    el = ui.textarea(value=_initial_preview).props(
+        'readonly outlined dark rows=32'
+    ).classes('w-full font-mono text-xs')
+    ctx['preview_el'] = el
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tab change
+# ─────────────────────────────────────────────────────────────────────────────
+
+def on_tab_change(e) -> None:
+    ctx['tab'] = TAB_MAP.get(e.value, 'article')
+    refresh_preview()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layout
+# ─────────────────────────────────────────────────────────────────────────────
+
+ui.add_css('''
+    .font-mono { font-family: "Courier New", Courier, monospace !important; }
+    .q-field__native { font-family: "Courier New", Courier, monospace !important; }
+''')
+
+# Header ──────────────────────────────────────────────────────────────────────
+with ui.header().classes('bg-grey-10 text-white px-4 gap-3 items-center'):
+    ui.icon('electrical_services').classes('text-blue-4 text-2xl')
+    ui.label('KiSoft One HIS — Client Simulator').classes('text-h6 font-bold')
+    ui.space()
+    with ui.row().classes('items-center gap-2'):
+        ui.input('Host', value='89.207.120.100').props('dense outlined dark standout').classes('w-44')
+        ui.number('Port', value=9801, min=1025, max=65535).props('dense outlined dark').classes('w-24')
+        ui.button('Connect', icon='cable').props('flat color=positive')
+
+# Split layout ────────────────────────────────────────────────────────────────
+with ui.splitter(value=58).classes('w-full h-screen') as sp:
+
+    # Left: tabs + forms ──────────────────────────────────────────────────────
+    with sp.before:
+        with ui.tabs(on_change=on_tab_change).classes('bg-grey-9 text-white w-full') as tabs:
+            tab_art = ui.tab('Articles (14N)',  icon='inventory_2')
+            tab_prt = ui.tab('Partners (15N)',  icon='people')
+            tab_rte = ui.tab('Routes (16N)',    icon='route')
+
+        with ui.tab_panels(tabs, value=tab_art).classes('w-full bg-grey-10'):
+
+            # 14N ─────────────────────────────────────────────────────────────
+            with ui.tab_panel(tab_art):
+                with ui.scroll_area().classes('w-full').style('height: calc(100vh - 115px)'):
+                    with ui.card().classes('w-full bg-grey-9 no-shadow q-pa-md'):
+                        ui.label('Article Master Data — 14N').classes('text-subtitle1 text-bold text-blue-3')
+                        ui.separator()
+
+                        with ui.grid(columns=3).classes('w-full gap-3'):
+                            bind_select('Station', STATIONS, art, 'station').classes('w-full')
+                            bind_select('Client', CLIENT_SELECT, art, 'client').classes('col-span-2 w-full')
+
+                        with ui.grid(columns=3).classes('w-full gap-3 q-mt-sm'):
+                            bind_input('Article Number (12)', art, 'article_number').classes('w-full')
+                            bind_number('Pack Size', art, 'pack_size', min=0, max=9999).classes('w-full')
+                            bind_number('Ejection # (10–80)', art, 'ejection_number', min=10, max=80).classes('w-full')
+                            bind_number('Max Quantity', art, 'max_quantity', min=1, max=9999).classes('w-full')
+                            bind_number('Length mm', art, 'length_mm', min=0, max=9999).classes('w-full')
+                            bind_number('Width mm', art, 'width_mm', min=0, max=9999).classes('w-full')
+                            bind_number('Height mm', art, 'height_mm', min=0, max=9999).classes('w-full')
+                            bind_number('Weight (1/10 g)', art, 'weight', min=1, max=300000).classes('w-full')
+
+                        with ui.grid(columns=2).classes('w-full gap-3 q-mt-sm'):
+                            bind_input('Article Name (40)', art, 'article_name').classes('w-full')
+                            bind_input('Geocode (12)', art, 'geocode').classes('w-full')
+                            bind_number('Min Stock', art, 'min_stock', min=0, max=9999).classes('w-full')
+                            bind_number('Max Stock', art, 'max_stock', min=0, max=9999).classes('w-full')
+                            bind_input('Replenishment Station (3)', art, 'repl_station').classes('w-full')
+                            bind_input('Replenishment Geocode (12)', art, 'repl_geocode').classes('w-full')
+
+                        ui.separator().classes('q-my-sm')
+                        ui.label('Characteristics').classes('text-caption text-grey-4')
+                        with ui.row().classes('flex-wrap gap-3 q-mt-xs'):
+                            for char in CHARS:
+                                def _mkchar(c=char):
+                                    def _on(e): art[f'char_{c}'] = e.value; refresh_preview()
+                                    return _on
+                                ui.checkbox(char, on_change=_mkchar())
+
+                        ui.label('Properties').classes('text-caption text-grey-4 q-mt-sm')
+                        with ui.row().classes('flex-wrap gap-3 q-mt-xs'):
+                            for code, label in PROPS:
+                                def _mkprop(p=code):
+                                    def _on(e): art[f'prop_{p}'] = e.value; refresh_preview()
+                                    return _on
+                                ui.checkbox(label, on_change=_mkprop())
+
+                        ui.separator().classes('q-my-sm')
+                        with ui.row().classes('items-center gap-2'):
+                            ui.label('Barcodes').classes('text-caption text-grey-4')
+                            ui.button('Add', icon='add', on_click=add_barcode).props('flat dense color=primary size=sm')
+                        barcode_list()
+
+            # 15N ─────────────────────────────────────────────────────────────
+            with ui.tab_panel(tab_prt):
+                with ui.scroll_area().classes('w-full').style('height: calc(100vh - 115px)'):
+                    with ui.card().classes('w-full bg-grey-9 no-shadow q-pa-md'):
+                        ui.label('Partner Master Data — 15N').classes('text-subtitle1 text-bold text-blue-3')
+                        ui.separator()
+                        with ui.grid(columns=2).classes('w-full gap-3'):
+                            bind_select('Client', CLIENT_SELECT, prt, 'client').classes('w-full')
+                            bind_input('Partner Number (12)', prt, 'partner_number').classes('w-full')
+                            bind_input('Company', prt, 'company').classes('w-full')
+                            bind_input('Title / Treatment', prt, 'treatment').classes('w-full')
+                            bind_input('Last Name', prt, 'last_name').classes('w-full')
+                            bind_input('First Name', prt, 'first_name').classes('w-full')
+                            bind_input('Street', prt, 'street').classes('w-full')
+                            bind_input('City', prt, 'city').classes('w-full')
+                            bind_input('ZIP Code (6)', prt, 'zip_code').classes('w-full')
+                            bind_input('Region', prt, 'region').classes('w-full')
+                            bind_input('Country Code (ISO 3166)', prt, 'country_code').classes('w-full')
+                            bind_input('Email', prt, 'email').classes('w-full')
+                        bind_input('Phone', prt, 'phone').classes('w-full q-mt-xs')
+
+            # 16N ─────────────────────────────────────────────────────────────
+            with ui.tab_panel(tab_rte):
+                with ui.scroll_area().classes('w-full').style('height: calc(100vh - 115px)'):
+                    with ui.card().classes('w-full bg-grey-9 no-shadow q-pa-md'):
+                        ui.label('Theoretical Route Master — 16N').classes('text-subtitle1 text-bold text-blue-3')
+                        ui.separator()
+                        with ui.grid(columns=2).classes('w-full gap-3'):
+                            bind_select('Client', CLIENT_SELECT, rte, 'client').classes('w-full')
+                            bind_input('Route Number (8)', rte, 'route_number').classes('w-full')
+                            bind_input('Departure Time (HHmmss)', rte, 'departure_time').props('placeholder="080000"').classes('w-full')
+                            bind_input('Availability Time (HHmmss)', rte, 'availability_time').props('placeholder="070000"').classes('w-full')
+                            bind_select('Day of Week', DAY_SELECT, rte, 'day_of_week').classes('w-full')
+
+                        ui.separator().classes('q-my-sm')
+                        with ui.row().classes('items-center gap-2'):
+                            ui.label('Dispatch Ramps').classes('text-caption text-grey-4')
+                            ui.label('(max 20)').classes('text-caption text-grey-6')
+                            ui.button('Add', icon='add', on_click=add_ramp).props('flat dense color=primary size=sm')
+                        ramp_list()
+
+    # Right: message preview ──────────────────────────────────────────────────
+    with sp.after:
+        with ui.card().classes('w-full bg-grey-9 no-shadow q-pa-sm').style('height: calc(100vh - 55px)'):
+            with ui.row().classes('items-center justify-between w-full q-mb-xs'):
+                ui.label('Message Preview').classes('text-subtitle2 text-bold text-blue-3')
+                def _copy():
+                    el = ctx['preview_el']
+                    text = el.value if el is not None else ''
+                    ui.run_javascript(
+                        f'navigator.clipboard.writeText({json.dumps(text)})'
+                    )
+                    ui.notify('Copied!', type='positive', position='top-right')
+                ui.button('Copy', icon='content_copy', on_click=_copy).props('flat dense color=primary size=sm')
+            ui.separator()
+            preview_area()
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+ui.run(title='KiSoft HIS Client', dark=True, port=8080, reload=False)
