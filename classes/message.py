@@ -10,7 +10,5 @@ class Message:
         self.packet    = encode_packet(self.data)
 
     def display(self) -> str:
-        raw      = self.packet
-        symbolic = f'[LF]{raw[1:-1].decode("utf-8")}[CR]'
-        hex_str  = ' '.join(f'{b:02X}' for b in raw)
-        return f'{symbolic}\n{hex_str}'
+        raw = self.packet
+        return f'[LF]{raw[1:-1].decode("utf-8")}[CR]'

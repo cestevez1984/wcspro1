@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """COHEN Guatemala – KiSoft One HIS Client Simulator"""
 
-import json, sys, os
+import json, queue, sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nicegui import ui
@@ -10,8 +10,11 @@ from classes import (
     PartnerMessage, PartnerTransmission,
     RouteMessage,   RouteTransmission,
     OrderMessage,
+    start_connections, stop_connections, drain_ui_queue,
 )
 from classes.order import INBOUND_TYPES
+from classes.connection import STATION_LABELS
+from server.scenarios import SCENARIOS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -61,6 +64,13 @@ TAB_MAP = {
     'Partners (15N)': 'partner',
     'Routes (16N)':   'route',
     'Orders (12N)':   'order',
+    'Scenarios':      'scenario',
+}
+
+ORDER_STATE_LABELS = {
+    '0001': 'started',       '0002': 'completed',
+    '0003': 'cancelled GUI', '0004': 'cancelled host',
+    '0010': 'last carrier',
 }
 
 MODE_OPTIONS = {'recreate': 'Recreate All', 'partial': 'Partial Update'}
@@ -82,7 +92,25 @@ order: dict = {
     'priority': 0, 'control_params': [], 'z_lines': [],
 }
 
-ctx: dict = {'tab': 'article', 'preview_el': None, 'received_el': None}
+scen: dict = {
+    'scenario_id':  SCENARIOS[0]['id'],
+    'client':       'A1301',
+    'order_number': 'TEST001',
+}
+
+ctx: dict = {
+    'tab':         'article',
+    'preview_el':  None,
+    'received_el': None,
+    # connection
+    'connected':   False,
+    'stop_event':  None,
+    'send_queue':  None,
+    'btn_conn':    None,
+    'btn_disc':    None,
+}
+
+ui_queue: queue.Queue = queue.Queue()   # threads → GUI bridge
 
 # Pre-compute initial preview (no event loop needed at this point)
 try:
@@ -94,6 +122,35 @@ except Exception as _e:
 # Preview helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _get_scenario(sc_id: str) -> dict:
+    for sc in SCENARIOS:
+        if sc['id'] == sc_id:
+            return sc
+    return SCENARIOS[0]
+
+
+def _build_order_from_scenario(sc: dict, client: str, order_number: str) -> dict:
+    z_lines, seen = [], set()
+    for resp in sc.get('responses', []):
+        for ln in resp.get('z_lines', []):
+            art = ln.get('article', '')
+            if art and art not in seen:
+                seen.add(art)
+                z_lines.append({
+                    'article':    art,
+                    'stock_type': ln.get('stock_type', 'STANDARD'),
+                    'quantity':   ln.get('quantity', 1),
+                })
+    carrier = sc['responses'][0].get('carrier_type', 'LARGE') if sc.get('responses') else 'LARGE'
+    return {
+        'client': client, 'order_number': order_number, 'sheet_number': 0,
+        'order_type': '10', 'carrier_type': carrier,
+        'partner_number': '', 'route_number': '', 'priority': 0,
+        'control_params': [], 'z_lines': z_lines,
+        'load_carrier_code': '', 'dest_stations': [], 'b_lines': [],
+    }
+
+
 def _set_preview(text: str) -> None:
     el = ctx['preview_el']
     if el is not None:
@@ -103,35 +160,64 @@ def _set_preview(text: str) -> None:
 def refresh_preview() -> None:
     try:
         tab = ctx['tab']
-        if tab == 'article':   msg = ArticleMessage(art)
-        elif tab == 'partner': msg = PartnerMessage(prt)
-        elif tab == 'order':   msg = OrderMessage(order)
-        else:                  msg = RouteMessage(rte)
+        if tab == 'article':    msg = ArticleMessage(art)
+        elif tab == 'partner':  msg = PartnerMessage(prt)
+        elif tab == 'order':    msg = OrderMessage(order)
+        elif tab == 'scenario':
+            od  = _build_order_from_scenario(
+                _get_scenario(scen['scenario_id']), scen['client'], scen['order_number'])
+            msg = OrderMessage(od)
+        else:                   msg = RouteMessage(rte)
         _set_preview(msg.display())
     except Exception as exc:
         _set_preview(f'Error building message:\n{exc}')
 
+def _enqueue(*packets) -> None:
+    """Put one or more encoded packets in send_queue if connected."""
+    sq = ctx.get('send_queue')
+    if ctx.get('connected') and sq:
+        for pkt in packets:
+            sq.put(pkt)
+
 def send_article() -> None:
     try:
-        _set_preview(ArticleTransmission(art.get('mode', 'recreate'), art).display())
+        tx = ArticleTransmission(art.get('mode', 'recreate'), art)
+        _set_preview(tx.display())
+        _enqueue(tx.open_msg.packet, tx.data_msg.packet, tx.close_msg.packet)
     except Exception as exc:
         _set_preview(f'Error building transmission:\n{exc}')
 
 def send_partner() -> None:
     try:
-        _set_preview(PartnerTransmission(prt.get('mode', 'recreate'), prt).display())
+        tx = PartnerTransmission(prt.get('mode', 'recreate'), prt)
+        _set_preview(tx.display())
+        _enqueue(tx.open_msg.packet, tx.data_msg.packet, tx.close_msg.packet)
     except Exception as exc:
         _set_preview(f'Error building transmission:\n{exc}')
 
 def send_route() -> None:
     try:
-        _set_preview(RouteTransmission(rte.get('mode', 'recreate'), rte).display())
+        tx = RouteTransmission(rte.get('mode', 'recreate'), rte)
+        _set_preview(tx.display())
+        _enqueue(tx.open_msg.packet, tx.data_msg.packet, tx.close_msg.packet)
     except Exception as exc:
         _set_preview(f'Error building transmission:\n{exc}')
 
+def send_scenario_order() -> None:
+    try:
+        od  = _build_order_from_scenario(
+            _get_scenario(scen['scenario_id']), scen['client'], scen['order_number'])
+        msg = OrderMessage(od)
+        _set_preview(msg.display())
+        _enqueue(msg.packet)
+    except Exception as exc:
+        _set_preview(f'Error building scenario order:\n{exc}')
+
 def send_order() -> None:
     try:
-        _set_preview(OrderMessage(order).display())
+        msg = OrderMessage(order)
+        _set_preview(msg.display())
+        _enqueue(msg.packet)
     except Exception as exc:
         _set_preview(f'Error building message:\n{exc}')
 
@@ -315,6 +401,51 @@ def direction_section() -> None:
             ui.label('No order lines added').classes('text-grey-6 text-caption')
 
 
+@ui.refreshable
+def scenario_tab_content() -> None:
+    sc = _get_scenario(scen['scenario_id'])
+    ui.label(sc['name']).classes('text-subtitle2 text-bold text-blue-3')
+    ui.label(sc.get('description', '')).classes('text-caption text-grey-4 q-mb-sm')
+    ui.separator().classes('q-my-sm')
+
+    ui.label('Responses').classes('text-caption text-grey-5 q-mb-xs')
+    for resp in sc.get('responses', []):
+        stn       = resp.get('last_scan_station', '')
+        stn_lbl   = STATION_LABELS.get(stn, '')
+        states_txt = '  ·  '.join(ORDER_STATE_LABELS.get(s, s) for s in resp.get('order_states', []))
+        with ui.card().classes('bg-grey-8 no-shadow q-pa-sm q-mb-xs w-full'):
+            with ui.row().classes('items-center gap-3 q-mb-xs'):
+                ui.badge(f'Sheet {resp["sheet"]}').props('color=blue-grey')
+                ui.badge(f'{stn} — {stn_lbl}' if stn_lbl else stn).props('color=teal')
+                ui.badge(resp.get('carrier_type', 'LARGE')).props('color=purple')
+                ui.label(states_txt).classes('text-caption text-grey-4')
+            for ln in resp.get('z_lines', []):
+                state = str(ln.get('line_state', '30'))
+                color = 'positive' if state == '30' else 'negative'
+                with ui.row().classes('items-center gap-2 q-mt-xs flex-wrap'):
+                    ui.badge(state).props(f'color={color}')
+                    ui.label(ln.get('article', '')).classes('font-mono text-caption')
+                    ui.label(f'qty {ln.get("quantity", 0)}').classes('text-caption text-grey-3')
+                    ui.label(ln.get('stock_type', '')).classes('text-caption text-grey-5')
+                    if ln.get('lot'):
+                        ui.label(f'lot {ln["lot"]}').classes('text-caption text-orange-4')
+                    if ln.get('geocode'):
+                        ui.label(f'geo {ln["geocode"]}').classes('text-caption text-teal-4')
+
+    ui.separator().classes('q-my-sm')
+    ui.label('12N that will be sent').classes('text-caption text-grey-5 q-mb-xs')
+    od = _build_order_from_scenario(sc, scen['client'], scen['order_number'])
+    ui.label(
+        f'Type 10 — Outbound delivery  ·  Carrier: {od["carrier_type"]}'
+    ).classes('text-caption text-grey-3')
+    for i, ln in enumerate(od.get('z_lines', []), 1):
+        ui.label(
+            f'  {i}.  {ln["article"]}   qty {ln["quantity"]}   {ln["stock_type"]}'
+        ).classes('font-mono text-caption text-grey-3 q-mt-xs')
+    if not od.get('z_lines'):
+        ui.label('No lines').classes('text-caption text-grey-6')
+
+
 def preview_area() -> None:
     el = ui.textarea(value=_initial_preview).props(
         'readonly outlined dark rows=20'
@@ -371,9 +502,32 @@ with ui.header().classes('bg-grey-10 text-white px-4 gap-3 items-center'):
     ui.label('KiSoft One HIS — Client Simulator').classes('text-h6 font-bold')
     ui.space()
     with ui.row().classes('items-center gap-2'):
-        ui.input('Host', value='89.207.120.100').props('dense outlined dark standout').classes('w-44')
-        ui.number('Port', value=9801, min=1025, max=65535).props('dense outlined dark').classes('w-24')
-        ui.button('Connect', icon='cable').props('flat color=positive')
+        host_input = ui.input('Host', value='127.0.0.1').props(
+            'dense outlined dark standout'
+        ).classes('w-44')
+
+        def _connect():
+            host = host_input.value or '127.0.0.1'
+            stop_ev, send_q = start_connections(host, ui_queue)
+            ctx['stop_event'] = stop_ev
+            ctx['send_queue'] = send_q
+            ctx['connected']  = True
+            ctx['btn_conn'].classes('hidden')
+            ctx['btn_disc'].classes(remove='hidden')
+            append_received(f'— connecting to {host} —')
+
+        def _disconnect():
+            if ctx.get('stop_event'):
+                stop_connections(ctx['stop_event'])
+            ctx['stop_event'] = None
+            ctx['send_queue'] = None
+            ctx['connected']  = False
+            ctx['btn_disc'].classes('hidden')
+            ctx['btn_conn'].classes(remove='hidden')
+            append_received('— disconnected —')
+
+        ctx['btn_conn'] = ui.button('Connect',    icon='cable',    on_click=_connect).props('flat color=positive')
+        ctx['btn_disc'] = ui.button('Disconnect', icon='link_off', on_click=_disconnect).props('flat color=negative').classes('hidden')
 
 # Split layout ────────────────────────────────────────────────────────────────
 with ui.splitter(value=58).classes('w-full h-screen') as sp:
@@ -381,10 +535,11 @@ with ui.splitter(value=58).classes('w-full h-screen') as sp:
     # Left: tabs + forms ──────────────────────────────────────────────────────
     with sp.before:
         with ui.tabs(on_change=on_tab_change).classes('bg-grey-9 text-white w-full') as tabs:
-            tab_art = ui.tab('Articles (14N)',  icon='inventory_2')
-            tab_prt = ui.tab('Partners (15N)',  icon='people')
-            tab_rte = ui.tab('Routes (16N)',    icon='route')
-            tab_ord = ui.tab('Orders (12N)',    icon='shopping_cart')
+            tab_art  = ui.tab('Articles (14N)', icon='inventory_2')
+            tab_prt  = ui.tab('Partners (15N)', icon='people')
+            tab_rte  = ui.tab('Routes (16N)',   icon='route')
+            tab_ord  = ui.tab('Orders (12N)',   icon='shopping_cart')
+            tab_scen = ui.tab('Scenarios',      icon='play_circle')
 
         with ui.tab_panels(tabs, value=tab_art).classes('w-full bg-grey-10'):
 
@@ -536,9 +691,52 @@ with ui.splitter(value=58).classes('w-full h-screen') as sp:
                             'color=primary'
                         ).classes('w-full')
 
+            # Scenarios ──────────────────────────────────────────────────────
+            with ui.tab_panel(tab_scen):
+                with ui.scroll_area().classes('w-full').style('height: calc(100vh - 115px)'):
+                    with ui.card().classes('w-full bg-grey-9 no-shadow q-pa-md'):
+
+                        ui.label('Quick Send — Scenarios').classes('text-subtitle1 text-bold text-blue-3')
+                        ui.separator()
+
+                        def _on_scen_sel(e):
+                            scen['scenario_id'] = e.value
+                            scenario_tab_content.refresh()
+                            refresh_preview()
+
+                        ui.select(
+                            {sc['id']: f'[{sc["category"]}]  {sc["name"]}' for sc in SCENARIOS},
+                            value=scen['scenario_id'],
+                            label='Scenario',
+                            on_change=_on_scen_sel,
+                        ).classes('w-full q-mt-sm').props('outlined dark dense')
+
+                        with ui.grid(columns=2).classes('w-full gap-3 q-mt-sm'):
+                            def _ch_scen_client(e):
+                                scen['client'] = e.value
+                                scenario_tab_content.refresh()
+                                refresh_preview()
+                            ui.select(CLIENT_SELECT, label='Client',
+                                      value=scen['client'],
+                                      on_change=_ch_scen_client).classes('w-full')
+
+                            def _ch_scen_order(e):
+                                scen['order_number'] = e.value
+                                scenario_tab_content.refresh()
+                                refresh_preview()
+                            ui.input('Order Number', value=scen['order_number'],
+                                     on_change=_ch_scen_order).classes('w-full')
+
+                        ui.separator().classes('q-my-sm')
+                        scenario_tab_content()
+
+                        ui.separator().classes('q-my-md')
+                        ui.button('Send Matching Order', icon='send',
+                                  on_click=send_scenario_order).props('color=primary').classes('w-full')
+
     # Right: preview (top) + received (bottom) ───────────────────────────────
     with sp.after:
-        with ui.splitter(value=58, horizontal=True).classes('w-full').style('height: calc(100vh - 55px)') as rsp:
+        with ui.splitter(value=38, horizontal=True).classes('w-full').style('height: calc(100vh - 55px)') as rsp:
 
             # ── Message Preview (top) ─────────────────────────────────────────
             with rsp.before:
@@ -564,12 +762,26 @@ with ui.splitter(value=58).classes('w-full h-screen') as sp:
                         with ui.row().classes('items-center gap-2'):
                             ui.icon('call_received').classes('text-green-4 text-sm')
                             ui.label('Received Messages').classes('text-subtitle2 text-bold text-green-4')
-                        def _clear_rx():
-                            _clear_received()
-                        ui.button('Clear', icon='delete_sweep', on_click=_clear_rx).props('flat dense color=negative size=sm')
+                        with ui.row().classes('items-center gap-1'):
+                            def _copy_rx():
+                                el = ctx['received_el']
+                                text = el.value if el is not None else ''
+                                ui.run_javascript(f'navigator.clipboard.writeText({json.dumps(text)})')
+                                ui.notify('Copied!', type='positive', position='top-right')
+                            def _clear_rx():
+                                _clear_received()
+                            ui.button('Copy', icon='content_copy', on_click=_copy_rx).props('flat dense color=primary size=sm')
+                            ui.button('Clear', icon='delete_sweep', on_click=_clear_rx).props('flat dense color=negative size=sm')
                     ui.separator()
                     received_area()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Drain socket queues into the Received Messages panel (10×/s)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _on_log(text: str) -> None:
+    append_received(f'— {text} —')
+
+ui.timer(0.1, lambda: drain_ui_queue(ui_queue, append_received, _on_log))
 
 ui.run(title='KiSoft HIS Client', dark=True, port=8083, reload=False)

@@ -556,6 +556,21 @@ Threads never touch UI elements directly. Instead:
 - Threads put `('received', data)` or `('log', text)` tuples into `ui_queue`
 - A `ui.timer(interval=0.1)` runs inside NiceGUI, drains the queue, calls `append_received()`
 - This avoids all thread-safety issues with NiceGUI's asyncio event loop
+- **CRITICAL**: drain logic must separate queue-get from processing into two separate try/except
+  blocks. A single combined try/except will silently stop draining if a non-`queue.Empty`
+  exception is raised during processing, leaving the rest of the queue unread.
+
+### NiceGUI shared state pitfalls
+- **Module-level Python state is NOT shared** between NiceGUI event callbacks and background
+  threads, even within the same PID. NiceGUI re-executes module-level layout code in its own
+  internal context; changes made there are invisible to daemon threads started before `ui.run()`.
+- **Workaround**: use a file, a socket, or `multiprocessing.Manager` for any state that must
+  be read by both NiceGUI callbacks and background threads. In this project: `active_scenario.txt`.
+- **`@ui.refreshable` rule**: never place interactive widgets (especially `ui.select` with
+  `on_change`) inside a `@ui.refreshable` function. The widget is destroyed and recreated on
+  `.refresh()`, which can fire while the widget's own callback is still executing, breaking
+  the event chain. Place the widget outside the refreshable; put only the display-only content
+  inside it.
 
 ### `recv_frame()` — reads exactly one complete frame
 Never use `s.recv(N)` directly — TCP can fragment. Always use:
@@ -588,37 +603,72 @@ ACK_MAP = {
 
 ---
 
-## Project Build Plan & Current Status
+## Project Status & File Reference
 
-### Approach
-Build the simulator **block by block**: client GUI → TCP connection logic → server mock.
+### How to run
 
-### Tech stack
-- **Language**: Python 3.11 (venv at `.pro1/`)
-- **GUI**: NiceGUI 2.x/3.x — web-based UI served on `localhost:8083`
-- **GUI style**: dark mode, NiceGUI
-- **Sockets**: stdlib `socket` + `threading`
-- Run: `.pro1/Scripts/python client/client_gui.py` → open `http://localhost:8083`
+```bash
+# Terminal 1 — mock server (KiSoft One simulator)
+.pro1/Scripts/python server/server_mock.py    →  http://localhost:8084
+
+# Terminal 2 — client simulator (Host)
+.pro1/Scripts/python client/client_gui.py     →  http://localhost:8083
+```
+
+Default host in client is `127.0.0.1` (localhost for local testing).
+For KNAPP's real system use `89.207.120.100`.
 
 ---
 
-### File structure (current)
+### Confirmed station assignments (COHEN Guatemala physical layout)
+
+| Station | Number | Notes |
+|---------|--------|-------|
+| Start station | 190 | **Always** the `start_station` (segment B) in every 32R |
+| CBS (SDA) | 091 | Conveyor belt station — check station SDA |
+| OSR | 092 | Automated storage/retrieval check station |
+| Bulk | 199 | Full-carton area — **always a separate loading unit**; ramp 00025 |
+| Manual M001 | 001 | Has two racks — geocode required to identify rack |
+| Manual M002 | 002 | Has two racks — geocode required |
+| Manual M003 | 003 | Has two racks — geocode required |
+| Manual M004 | 004 | Has two racks — geocode required |
+| Controlled substance | 010 | Special handling station |
+| Cooling | 011 | Refrigerated items station |
+
+**Carrier codes**: HU00001 – HU00999 (format for all loading units)
+
+**Dispatch ramps**: `00025` for Bulk (199), `00001`–`00010` for all other stations
+
+**Default test values**: client = `A1301` (AJISA), order_number = `TEST001`
+
+---
+
+### Complete file structure
 
 ```
 wcspro1/
   classes/
-    __init__.py          # exports all message/transmission classes
-    protocol.py          # encode_packet, pad_alpha, pad_num
-    message.py           # base Message class (record_id + data → packet + display)
-    transmission.py      # base Transmission class (open + data + close)
-    article.py           # ArticleMessage (14N), ArticleTransmission (140/141→14N→149)
-    partner.py           # PartnerMessage (15N), PartnerTransmission (150/151→15N→159)
-    route.py             # RouteMessage (16N), RouteTransmission (160/161→16N→169)
-    order.py             # OrderMessage (12N) — standalone, no transmission wrapper
+    __init__.py           # exports everything below
+    protocol.py           # encode_packet, pad_alpha, pad_num
+    message.py            # base Message class
+    transmission.py       # base Transmission class (open + data + close)
+    article.py            # ArticleMessage (14N), ArticleTransmission (140/141→14N→149)
+    partner.py            # PartnerMessage (15N), PartnerTransmission (150/151→15N→159)
+    route.py              # RouteMessage (16N), RouteTransmission (160/161→16N→169)
+    order.py              # OrderMessage (12N) — standalone, no wrapper
+    order_response.py     # OrderResponseMessage (32R) + parse_12n()
+    connection.py         # recv_frame, thread_9801, thread_9802,
+                          # start_connections, stop_connections,
+                          # drain_ui_queue, format_received
   client/
-    client_gui.py        # main GUI (current)
-    client_gui_v2.py     # backup before Orders tab was added
-    client_gui_backup.py # earlier backup before class refactor
+    client_gui.py         # main client GUI  (port 8083)
+    client_gui_v2.py      # backup before Orders tab
+    client_gui_backup.py  # backup before class refactor
+  server/
+    __init__.py
+    scenarios.py             # static scenario definitions (SCENARIOS list)
+    server_mock.py           # KiSoft One mock server GUI  (port 8084)
+    active_scenario.txt      # persists selected scenario ID across NiceGUI re-initializations
   CLAUDE.md
 ```
 
@@ -626,21 +676,26 @@ wcspro1/
 
 ### `classes/` architecture decisions
 
+- **All non-GUI logic lives in `classes/`** — including socket/connection code
 - **Entity-specific classes** inherit from base `Message` / `Transmission`
-  - Why: adding a field to Articles means editing only `article.py`, not a shared builder
-- **Base `Message`**: takes `record_id` + `data` string → builds packet bytes → `display()` returns symbolic + hex
-- **Base `Transmission`**: holds open/data/close `Message` objects → `display()` joins all three
-- **Open/close records** (140, 150, 160…): `data = record_id` only — produces `COUNT = 00008` always
+  - Adding a field to one entity → edit only that entity's file
+- **Base `Message`**: `record_id` + `data` string → `packet` bytes + `display()` (symbolic only)
+- **Base `Transmission`**: holds `open_msg / data_msg / close_msg` → `display()` joins all three
+- **Open/close records** (140, 150, 160…): `data = record_id` only → `COUNT = 00008` always
 - **`OrderMessage` (12N)**: standalone — no Transmission wrapper
-  - `order_type` in `{'02','04','05'}` → inbound with `b`-lines
-  - `order_type` in `{'10','35','36'}` → outbound with `Z`-lines
-  - Scope: only these 6 order types implemented
+  - `order_type` in `{'02','04','05'}` → inbound → `b`-lines
+  - `order_type` in `{'10','35','36'}` → outbound → `Z`-lines
+- **`OrderResponseMessage` (32R)**: built from `order_info` dict + one `response` dict from a scenario
+  - `parse_12n(data: bytes) → dict` extracts client/order_number/sheet/type from received 12N bytes
+  - Z-line wire order: article(12) · pack_size(4) · stock_type(8) · lot(00 or 20) · expiry(00) · quantity(4) · quality(1) · line_state(2) · geocode(00 or 12)
+  - lot and geocode use variable-length encoding: `'00'` when empty, `'20'`/`'12'` + value when present
+  - Both always emitted (even as `'00'`) so the parser has a fixed-offset contract
 
 ---
 
 ### `client/client_gui.py` — current state
 
-**Left panel — 4 tabs:**
+**Left panel — 5 tabs:**
 
 | Tab | Record | Mode toggle | Dynamic lists |
 |-----|--------|-------------|---------------|
@@ -648,39 +703,185 @@ wcspro1/
 | Partners (15N) | 15N | Recreate / Partial | — |
 | Routes (16N) | 16N | Recreate / Partial | Ramps (add/remove, max 20) |
 | Orders (12N) | 12N | — (standalone) | Dest stations, b-lines or Z-lines |
+| Scenarios | 12N | — | Scenario picker, auto-builds 12N from scenario |
 
-- Orders tab uses `@ui.refreshable direction_section()` that rebuilds when order type changes
-- Send Message on Articles/Partners/Routes → shows full Transmission (open + data + close)
-- Send Message on Orders → shows single 12N packet only
+- Scenarios tab: dropdown selects scenario → shows response summary (stations, Z-lines, lot, geocode) + auto-generated 12N preview → **Send Matching Order** enqueues 1 packet
+- Default client in Scenarios tab: `A1301`
 
-**Right panel — vertically split (58% / 42%):**
-- **Top: Message Preview** — live preview updates on every field change, Copy + Clear buttons
-- **Bottom: Received Messages** — for incoming frames from port 9802; `append_received(text)` prepends newest with timestamp and separator line; Clear button
+**Right panel — vertically split (38% / 62%):**
+- **Top: Message Preview** (38%) — live preview; Copy + Clear buttons
+- **Bottom: Received Messages** (62%) — shows ACKs (9801) and pushed messages (9802);
+  `append_received(text)` prepends newest with timestamp + separator; **Copy + Clear** buttons
+  - Copy uses `ui.run_javascript(f'navigator.clipboard.writeText(...)')` — preserves all formatting
 
-**UI patterns used:**
-- `@ui.refreshable` for dynamic lists (barcodes, ramps, direction_section)
-- Direct element reference (`ctx['preview_el']`, `el.value = text; el.update()`) for preview — avoids event-loop timing issues with refreshable
-- `bind_input / bind_number / bind_select` helpers update state dict + call `refresh_preview()` on every change
-- `ctx['tab']` tracks active tab so `refresh_preview()` knows which message to build
+**Header — Connect / Disconnect toggle:**
+- Connect → calls `start_connections(host, ui_queue)`, stores `stop_event` + `send_queue` in `ctx`
+- Disconnect → calls `stop_connections(stop_event)`, clears ctx
+- Both buttons exist in DOM; one hidden at a time via `.classes('hidden')`
+
+**Connection wiring:**
+- `ui_queue: queue.Queue` at module level — shared between GUI and socket threads
+- `ui.timer(0.1, drain_ui_queue(...))` drains 10×/s into `append_received()`
+- `_enqueue(*packets)` puts frames into `ctx['send_queue']` only when connected
+
+**UI patterns:**
+- `@ui.refreshable` for dynamic lists (barcodes, ramps, direction_section, scenario_tab_content)
+- Direct element reference (`ctx['preview_el']`, `el.value = text; el.update()`) for preview
+- `bind_input / bind_number / bind_select` helpers: update state dict + call `refresh_preview()`
+
+---
+
+### `server/server_mock.py` — current state
+
+**Two listener threads** (server-side: bind/listen/accept, not connect):
+
+```
+server_thread_9801:
+  bind(9801) → accept client → recv any HIS frame → send ACK
+  if 12N: parse order_info → put order_info alone in trigger_queue
+
+server_thread_9802:
+  bind(9802) → accept client → wait on trigger_queue
+  dequeue order_info → call _get_selected() at that moment (reads file)
+  for each response in scenario: send 32R → recv 42R ACK
+```
+
+**`trigger_queue`** carries **only `order_info`** (not the scenario). Scenario is resolved at
+processing time by `_get_selected()` reading `active_scenario.txt` — always gets the freshest selection.
+
+**`highest_sheet`** is computed as `max(r.get('sheet', 1) for r in responses)` — the number of
+distinct loading units. This is NOT `len(responses)` (which counts station scans, not carriers).
+
+**`_get_active_id()` validation**: reads `active_scenario.txt`, checks the stored ID against
+`{sc['id'] for sc in SCENARIOS}` — falls back to `SCENARIOS[0]['id']` if stale. Prevents
+`ValueError: Invalid value` crash on server startup when scenarios are renamed.
+
+**Reconnect safety in `server_thread_9802`:** on any send/recv exception: re-queue `order_info`,
+then `break` to accept new client. Without re-queue the trigger was silently lost.
+
+**Scenario persistence — `server/active_scenario.txt`:**
+- NiceGUI re-executes module-level layout code in a context isolated from background threads.
+  Module-level Python dict changes are invisible to the socket threads — even in the same PID.
+- Fix: selection stored in `active_scenario.txt`. `_on_select` writes; `_get_selected()` reads.
+- Initialized to `SCENARIOS[0]['id']` only if the file does not already exist.
+
+**`format_received()` in `classes/connection.py`:**
+- For `32R`: prepends a station/carrier banner extracted from fixed offsets before the raw frame:
+  ```
+  ═══════════════════════════════════════════════════
+  ▶▶▶  HU00001  ·  STATION 091  —  CBS (SDA check station)  ◀◀◀
+  ═══════════════════════════════════════════════════
+  ```
+  Carrier code from `s[77:85]`, last_scan_station from `s[130:133]`, label from `STATION_LABELS`.
+- Then shows `[LF]…[CR]` raw frame, then full field-by-field breakdown including lot + geocode.
+- `_parse_32r()` reads lot and geocode with variable-length tags (always present, even as `'00'`).
+
+---
+
+### `server/scenarios.py` — scenario structure
+
+Each scenario has a `responses` list — **one entry per station scan event** (one 32R per entry).
+The mock sends one `32R` per entry with 0.8s delay.
+
+**CRITICAL — confirmed 32R semantics:**
+- One `32R` per station the carrier passes through (`last_scan_station` = that station)
+- Multiple articles at the same station → multiple Z-lines in ONE 32R (not multiple 32Rs)
+- Multiple stations → multiple `responses` entries, each a separate 32R
+- `start_station` = always `'190'` (start station, segment B)
+- `sheet` = loading unit number (HU00001=1, HU00002=2 …)
+- `highest_sheet` = `max(sheet)` = total loading units for the order
+- Bulk (199) always goes in a **separate** loading unit from everything else
+- First response: `order_states=['0001']`; intermediate: `[]`; last: `['0002', '0010']`
+- Single-response scenarios: `order_states=['0001', '0002', '0010']` (all in one)
+
+```python
+{
+    'sheet':              1,          # loading unit number
+    'carrier_type':       'LARGE',
+    'carrier_code':       'HU00001',  # HU00001 – HU00999
+    'start_station':      '190',      # always 190
+    'last_scan_station':  '091',      # station that triggered this 32R
+    'scan_state':         '1',        # 1=passed, 0=not passed
+    'dispatch_ramp':      '00001',    # 00025 for Bulk; 00001-00010 for others
+    'order_states':       ['0001'],
+    'z_lines': [
+        {
+            'article':    'ARCBS01',
+            'pack_size':  1,
+            'stock_type': 'STANDARD',
+            'lot':        'LTC001',       # '' for no lot
+            'quantity':   3,
+            'quality':    '1',
+            'line_state': '30',
+            'geocode':    '001XXXYYYZZZ', # '' for no geocode; required for manual stations
+        },
+    ],
+}
+```
+
+**Current scenarios (7 outbound defined):**
+
+| Code | ID | 32R msgs | Carriers | Description |
+|------|----|----------|----------|-------------|
+| 101 | `out_101_cbs_1art` | 1 | HU00001 | ARCBS01 from CBS (091) |
+| 102 | `out_102_cbs_osr_1carrier` | 2 | HU00001 | ARCBS01 CBS (091) + AROSR01 OSR (092), same carrier |
+| 103 | `out_103_partial_oos` | 1 | HU00001 | ARCBS01 OK + ARCBS02 out of stock (58) |
+| 104 | `out_104_3art_cbs` | 1 | HU00001 | 3 CBS articles, all state 30 |
+| 105 | `out_105_manual_osr_3msg` | 3 | HU00001 | ARM0011 M001 (001) + ARM0021 M002 (002) + AROSR01 OSR (092) |
+| 106 | `out_106_bulk_osr_2carriers` | 2 | HU00001+HU00002 | AR0001 Bulk(199) pack=12 + AR0002 OSR(092) pack=1 |
+| 107 | `out_107_mixed_2carriers` | 5 | HU00001+HU00002 | HU00001: Bulk(199); HU00002: CBS(091)+OSR(092)+M001(001)+M003(003) |
+
+**Pending scenarios to add:** physical inventory, replenishment, inbound goods-in, cancelled order,
+quantity mismatch, cooling/controlled substance station scenarios.
+
+---
+
+### End-to-end test flow
+
+1. Start mock server → `http://localhost:8084` → select a scenario
+2. Start client → `http://localhost:8083` → **Scenarios** tab
+3. Set client=A1301, order_number=TEST001 → **Send Matching Order**
+4. Mock 9801 receives 12N → sends 22N ACK → appears in Received Messages
+5. Mock 9802 fires one 32R per response entry → each appears with station banner + field breakdown
+6. Client 9802 auto-sends 42R ACK for each → mock logs it
+
+---
+
+### SAP/ABAP integration — discussion notes
+
+A future Host client could be built several ways:
+
+- **ABAP native TCP** (`CL_TCP_SOCKET` or `SOCKET` function group): doable, but port 9802 needs a
+  blocking listener waiting for KiSoft pushes — this fights ABAP's synchronous dialog model.
+  Would require a background job or RFC server for port 9802.
+- **Java/.NET middleware (PI/PO or BTP Integration Suite)**: SAP posts IDocs/BAPIs, middleware
+  translates to HIS. Clean separation but more moving parts.
+- **RFC + Python (recommended)**: keep the Python client as the TCP layer, expose it via RFC or
+  REST, call from ABAP. SAP stays in its lane; Python handles the async complexity already solved here.
 
 ---
 
 ### What comes next
 
-1. **`client/connection.py`** — socket layer
-   - `recv_frame(s)` shared helper
-   - `thread_9801(host, stop_event, send_queue, ui_queue)`
-   - `thread_9802(host, stop_event, ui_queue)`
-   - `start_connections(host)` / `stop_connections()`
+1. **More scenarios** — physical inventory, replenishment, inbound (goods-in), cancelled order, cooling/controlled substance
+2. **Heartbeat** — `1HR` sent every 60s of silence on port 9801; mock sends `3HR` on 9802
+3. **Connection status badges** — per-port indicators in client header (connected / error)
+4. **Real KNAPP connection** — switch host to `89.207.120.100`, test against live system
+5. **SAP client** — RFC+Python bridge when ready to integrate with ECC/S4
 
-2. **Wire into GUI**
-   - Connect button → `start_connections(host)`; start `ui.timer` to drain `ui_queue`
-   - Send Message buttons → put encoded frame in `send_queue` instead of just showing preview
-   - Header shows connection status (connected / disconnected / error) per port
+---
 
-3. **`server/server_mock.py`** — KiSoft One simulator
-   - Listens on ports 9801 and 9802
-   - Receives 12N on 9801, sends 22N ACK, then sends scenario's 32R on 9802
-   - **Scenario approach**: static Python dicts, selected in mock GUI before client sends
-   - Example scenario: "Three articles — one loading unit" → 32R with 3 Z-lines, state 30, one carrier code
-   - Heartbeat: leave for after basic send/receive is working
+### Bugs fixed during development
+
+| Bug | Root cause | Fix |
+|-----|-----------|-----|
+| `parse_12n` wrong client field | Offset `s[7:23]` should be `s[5:21]` — the `'16'` length tag is 2 chars, not 4 | Fixed in `classes/order_response.py` |
+| 22N / 32R not appearing in client panel | `drain_ui_queue` used one try/except for both queue-get and processing — a display error silently stopped the drain loop | Split into two separate try/except blocks |
+| Hex dump shown in preview and received panels | `Message.display()` and `format_received()` included raw hex | Removed; now symbolic only |
+| Scenario selection always returned scenario 1 | NiceGUI re-executes layout code in a context isolated from background threads | Replaced module-level dict with `active_scenario.txt` |
+| Stale scenario in trigger_queue | `server_thread_9801` stored scenario at receive time | `trigger_queue` holds only `order_info`; scenario resolved at send time |
+| `@ui.refreshable` dropdown breaking itself | `ui.select` inside refreshable destroyed mid-callback | Moved `ui.select` outside refreshable |
+| Second send yields no 32R after reconnect | Dead `conn` held `with conn:` block; trigger consumed but `sendall` silently failed | Re-queue `order_info` + `break` on exception |
+| scan_state semantics inverted | Scenarios used `'0'` for passed; spec is `'1'`=passed | Corrected all scenario values; updated `_SCAN_STATE` labels |
+| `highest_sheet` wrong for multi-station single-carrier | Used `len(responses)` (counts 32R messages) instead of max sheet number | Changed to `max(r.get('sheet', 1) for r in responses)` |
+| Server crash on startup with stale `active_scenario.txt` | `_get_active_id()` returned an ID no longer in SCENARIOS; `ui.select` raised `ValueError: Invalid value` | Added validation: check stored ID against current scenario list; fall back to `SCENARIOS[0]` |
