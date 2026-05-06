@@ -10,12 +10,14 @@ STATION_LABELS = {
     '002': 'Manual M002',
     '003': 'Manual M003',
     '004': 'Manual M004',
+    '086': 'RL002 Manual consolidation',
     '010': 'M010 Controlled substance',
     '011': 'M011 Cooling',
     '061': 'BULK001 Full carton',
     '065': 'OSR Shuttle (pick)',
     '091': 'CBS (SDA check station)',
     '092': 'OSR (check station)',
+    '093': 'FCS001 Final control',
     '095': 'GPA001 Marking',
     '190': 'OS001 Start station',
     '199': 'Bulk station',
@@ -183,6 +185,43 @@ def _parse_32r(s: str) -> str:
             row.append(f'            geocode     {geocode}')
         L += row
 
+    # ── b — storage lines (inbound) ───────────────────────────────────────────
+    if pos < len(s) and s[pos] == 'b':
+        bcnt = int(s[pos + 1:pos + 3])
+        pos += 3
+        L.append('')
+        L.append(f'  b  storage lines ({bcnt}):')
+        for i in range(bcnt):
+            if i > 0:
+                L.append('')
+            article    = s[pos + 2:pos + 14].strip(); pos += 14
+            pack_size  = s[pos + 2:pos + 6];          pos += 6
+            stock_type = s[pos + 2:pos + 10].strip(); pos += 10
+            lot_len    = int(s[pos:pos + 2]);          pos += 2
+            lot        = s[pos:pos + lot_len].strip(); pos += lot_len
+            expiry_len = int(s[pos:pos + 2]);          pos += 2
+            expiry     = s[pos:pos + expiry_len];      pos += expiry_len
+            quantity   = s[pos + 2:pos + 6];           pos += 6
+            quality    = s[pos + 2:pos + 3];           pos += 3
+            line_state = s[pos + 2:pos + 4].strip();   pos += 4
+            mark       = '✓' if line_state == '30' else '✗'
+            state_desc = _LINE_STATE.get(line_state, '')
+            row = [
+                f'       [{i + 1}]  article     {article}',
+                f'            pack_size   {pack_size}',
+                f'            stock_type  {stock_type}',
+            ]
+            if lot:
+                row.append(f'            lot         {lot}')
+            if expiry:
+                row.append(f'            expiry      {expiry}')
+            row += [
+                f'            quantity    {quantity}',
+                f'            quality     {quality}',
+                f'            line_state  {line_state}  {mark}  {state_desc}',
+            ]
+            L += row
+
     return '\n'.join(L)
 
 
@@ -197,7 +236,6 @@ def format_received(data: bytes) -> str:
     raw_line  = f'[LF]{packet[1:-1].decode("utf-8")}[CR]'
 
     if text[:3] == '32R':
-        # Extract carrier and station directly from fixed offsets (no parser needed)
         carrier_code      = text[77:85].strip()
         last_scan_station = text[130:133].strip()
         station_label     = STATION_LABELS.get(last_scan_station, last_scan_station)
@@ -215,7 +253,12 @@ def format_received(data: bytes) -> str:
         divider = '·' * 44
         return f'{bar}\n{banner}\n{bar}\n\n{raw_line}\n\n{divider}\n\n32R — Order Response\n\n{parsed}'
 
-    return raw_line
+    # All other messages: simple header + raw frame
+    record_id   = text[:3]
+    status      = text[3:5] if len(text) >= 5 else ''
+    status_desc = 'OK' if status == '00' else (f'error  {status}' if status else '')
+    bar = '─' * 36
+    return f'{bar}\n▶  {record_id}  {status_desc}\n{bar}\n\n{raw_line}'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -308,7 +351,8 @@ def drain_ui_queue(ui_queue: queue.Queue, on_received, on_log) -> None:
             break
         try:
             if kind in ('received', 'ack'):
-                on_received(format_received(payload))
+                port = '9802' if kind == 'received' else '9801'
+                on_received(format_received(payload), port)
             elif kind == 'log':
                 on_log(payload)
         except Exception as exc:

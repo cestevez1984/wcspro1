@@ -325,9 +325,11 @@ Y [count_filters]
 | OSR Shuttle | 065 | Automated storage/retrieval |
 | Full carton | 199 | Full carton area |
 | ST003_PUT | 017 | Non-reusable items destination |
-| OS001 | 190 | Output station |
-| CS001 | 091 | Check station 1 |
-| CS002 | 092 | Check station 2 |
+| OS001 | 190 | Output station (always start_station in 32R) |
+| CS001 | 091 | CBS check station (SDA) |
+| CS002 | 092 | OSR check station |
+| RL002 | 086 | Manual pick consolidation point |
+| FCS001 | 093 | Final control station |
 | GPA001 | 095 | Marking station |
 | PA002 | 027 | Verification station |
 | Flow rack L | 244 | SDA left (replenishment) |
@@ -627,15 +629,19 @@ For KNAPP's real system use `89.207.120.100`.
 | Start station | 190 | **Always** the `start_station` (segment B) in every 32R |
 | CBS (SDA) | 091 | Conveyor belt station — check station SDA |
 | OSR | 092 | Automated storage/retrieval check station |
-| Bulk | 199 | Full-carton area — **always a separate loading unit**; ramp 00025 |
+| RL002 | 086 | Manual pick consolidation — **all manual station picks (001-004) produce ONE 32R here**; geocodes identify racks |
+| FCS001 | 093 | Final control station — **always the last 32R** in every outbound order; carries `['0002','0010']`; consolidates all Z-lines except cooling, controlled, and bulk |
+| Bulk | 199 | Full-carton area — **always a separate loading unit**; ramp 00025; **never included in FCS001 Z-lines** |
 | Manual M001 | 001 | Has two racks — geocode required to identify rack |
 | Manual M002 | 002 | Has two racks — geocode required |
 | Manual M003 | 003 | Has two racks — geocode required |
 | Manual M004 | 004 | Has two racks — geocode required |
-| Controlled substance | 010 | Special handling station |
-| Cooling | 011 | Refrigerated items station |
+| Controlled | 010 | Controlled substance station — **isolated**: own 32R, **not included** in FCS001 Z-lines |
+| Cooling | 011 | Refrigerated items station — **isolated**: own 32R, **not included** in FCS001 Z-lines |
 
-**Carrier codes**: HU00001 – HU00999 (format for all loading units)
+**Carrier codes**: HU00001 – HU00999 (format for outbound loading units), HU00010+ for inbound receiving units
+
+**OSR inbound storage units**: SU00001–SU00999 (carrier_code in 32R responses for inbound)
 
 **Dispatch ramps**: `00025` for Bulk (199), `00001`–`00010` for all other stations
 
@@ -705,13 +711,15 @@ wcspro1/
 | Orders (12N) | 12N | — (standalone) | Dest stations, b-lines or Z-lines |
 | Scenarios | 12N | — | Scenario picker, auto-builds 12N from scenario |
 
-- Scenarios tab: dropdown selects scenario → shows response summary (stations, Z-lines, lot, geocode) + auto-generated 12N preview → **Send Matching Order** enqueues 1 packet
+- Scenarios tab: dropdown uses `[OUT]`/`[IN]` prefix to distinguish outbound vs inbound scenarios
+- Inbound scenarios: **Send Matching Order** sends one 12N per loading unit (N packets total)
+- Outbound scenarios: **Send Matching Order** sends one 12N
 - Default client in Scenarios tab: `A1301`
 
 **Right panel — vertically split (38% / 62%):**
-- **Top: Message Preview** (38%) — live preview; Copy + Clear buttons
-- **Bottom: Received Messages** (62%) — shows ACKs (9801) and pushed messages (9802);
-  `append_received(text)` prepends newest with timestamp + separator; **Copy + Clear** buttons
+- **Top: Message Preview** (38%) — shows **friendly field-by-field breakdown** above the raw frame
+- **Bottom: Received Messages** (62%) — shows ACKs and pushed messages with `← PORT 9801/9802` tag;
+  `append_received(text, port)` prepends newest with timestamp + port tag + separator
   - Copy uses `ui.run_javascript(f'navigator.clipboard.writeText(...)')` — preserves all formatting
 
 **Header — Connect / Disconnect toggle:**
@@ -729,6 +737,21 @@ wcspro1/
 - Direct element reference (`ctx['preview_el']`, `el.value = text; el.update()`) for preview
 - `bind_input / bind_number / bind_select` helpers: update state dict + call `refresh_preview()`
 
+**Friendly preview formatters:**
+- `_friendly_article(s)` → human-readable 14N breakdown
+- `_friendly_partner(s)` → human-readable 15N breakdown
+- `_friendly_route(s)` → human-readable 16N breakdown
+- `_friendly_order(s, title_suffix='')` → human-readable 12N breakdown (inbound or outbound)
+- `_preview_text(friendly, msg)` → joins friendly text + `·` divider + `msg.display()`
+- All `send_*` and `refresh_preview` functions use `_preview_text(friendly, msg)`
+- **CRITICAL ordering rule**: `_initial_preview` must be computed **after** all helper functions are
+  defined (after `_preview_text`). Computing it at the wrong point causes a `NameError` caught
+  silently by try/except, leaving the panel showing an error string instead of the article preview.
+
+**Inbound multi-packet preview:**
+- When sending an inbound scenario with N loading units, the preview shows N blocks separated by
+  `═══` dividers, each with `[1/N] HU00010` suffix so the user can see each 12N clearly.
+
 ---
 
 ### `server/server_mock.py` — current state
@@ -738,12 +761,33 @@ wcspro1/
 ```
 server_thread_9801:
   bind(9801) → accept client → recv any HIS frame → send ACK
-  if 12N: parse order_info → put order_info alone in trigger_queue
+  if 12N outbound (order_type NOT in {'02','04','05'}): put order_info in trigger_queue immediately
+  if 12N inbound  (order_type in {'02','04','05'}):     accumulate in _inbound_buffer;
+                                                         trigger only when all LUs received
 
 server_thread_9802:
   bind(9802) → accept client → wait on trigger_queue
   dequeue order_info → call _get_selected() at that moment (reads file)
   for each response in scenario: send 32R → recv 42R ACK
+```
+
+**`_inbound_buffer`** — module-level dict `{order_number: count_received}`. Single writer thread
+(server_thread_9801) so no lock needed. Entry deleted after trigger fires.
+
+**Inbound trigger detection** uses `order_type` from the parsed 12N, **not** `scenario.get('category')`.
+Using the scenario category was wrong because the selected scenario might be outbound even when
+the arriving 12N is inbound-typed.
+
+```python
+if order_type in ('02', '04', '05'):   # inbound
+    key = order_info['order_number']
+    expected = len(scenario.get('loading_units', [])) or 1
+    _inbound_buffer[key] = _inbound_buffer.get(key, 0) + 1
+    if _inbound_buffer[key] >= expected:
+        trigger_queue.put(order_info)
+        del _inbound_buffer[key]
+else:                                   # outbound
+    trigger_queue.put(order_info)
 ```
 
 **`trigger_queue`** carries **only `order_info`** (not the scenario). Scenario is resolved at
@@ -773,17 +817,24 @@ then `break` to accept new client. Without re-queue the trigger was silently los
   ═══════════════════════════════════════════════════
   ```
   Carrier code from `s[77:85]`, last_scan_station from `s[130:133]`, label from `STATION_LABELS`.
-- Then shows `[LF]…[CR]` raw frame, then full field-by-field breakdown including lot + geocode.
+- For non-32R messages: simpler banner `▶  record_id  OK/error_code`.
+- Then shows `[LF]…[CR]` raw frame, then full field-by-field breakdown including lot + geocode + b-lines.
 - `_parse_32r()` reads lot and geocode with variable-length tags (always present, even as `'00'`).
+
+**`drain_ui_queue()` port detection:**
+- Tuples from threads: `('received', data)` = from port 9802, `('ack', data)` = from port 9801.
+- The drain function maps these to a port string and passes it to `on_received(text, port)`.
+- `append_received(text, port)` adds `← PORT 9801` or `← PORT 9802` to the timestamp line.
 
 ---
 
 ### `server/scenarios.py` — scenario structure
 
-Each scenario has a `responses` list — **one entry per station scan event** (one 32R per entry).
+Each outbound scenario has a `responses` list — **one entry per station scan event** (one 32R per entry).
+Each inbound scenario has both `loading_units` (drives 12N messages) and `responses` (drives 32R).
 The mock sends one `32R` per entry with 0.8s delay.
 
-**CRITICAL — confirmed 32R semantics:**
+**CRITICAL — confirmed outbound 32R semantics:**
 - One `32R` per station the carrier passes through (`last_scan_station` = that station)
 - Multiple articles at the same station → multiple Z-lines in ONE 32R (not multiple 32Rs)
 - Multiple stations → multiple `responses` entries, each a separate 32R
@@ -791,9 +842,14 @@ The mock sends one `32R` per entry with 0.8s delay.
 - `sheet` = loading unit number (HU00001=1, HU00002=2 …)
 - `highest_sheet` = `max(sheet)` = total loading units for the order
 - Bulk (199) always goes in a **separate** loading unit from everything else
-- First response: `order_states=['0001']`; intermediate: `[]`; last: `['0002', '0010']`
-- Single-response scenarios: `order_states=['0001', '0002', '0010']` (all in one)
+- Manual stations (001-004) always consolidate into **one 32R** at RL002 (086) with geocodes per rack
+- Cooling (011) and Controlled (010) each get their own isolated 32R, **never merged** into FCS001
+- **FCS001 (093) is always the last `response` entry** in every outbound scenario; it carries
+  `order_states=['0002','0010']` and consolidates all Z-lines from non-cooling/non-controlled/non-bulk stations
+- First response: `order_states=['0001']`; intermediate: `[]`; last (FCS001): `['0002', '0010']`
+- Single-response scenarios: `order_states=['0001', '0002', '0010']` (all in one, FCS001 only)
 
+**Outbound response entry structure:**
 ```python
 {
     'sheet':              1,          # loading unit number
@@ -819,20 +875,58 @@ The mock sends one `32R` per entry with 0.8s delay.
 }
 ```
 
-**Current scenarios (7 outbound defined):**
+**Inbound scenario structure:**
+```python
+{
+    'id': 'in_101_osr_decanting',
+    'category': 'Inbound',
+    'loading_units': [             # one entry per 12N message sent by client
+        {
+            'carrier_code': 'HU00010',
+            'b_lines': [
+                {
+                    'article': 'AROSR04', 'quantity': 10, 'pack_size': 1,
+                    'stock_type': 'STANDARD', 'lot': 'LTC001', 'expiry': '20300101',
+                    'station': '065', 'stock_quality': '1',
+                },
+            ],
+        },
+    ],
+    'responses': [                 # one entry per 32R pushed by KiSoft on 9802
+        {
+            'sheet':             1,
+            'carrier_code':      'SU00001',  # OSR storage unit code
+            'carrier_type':      '',
+            'last_scan_station': '065',
+            'order_states':      ['0002'],
+            'z_lines':           [],
+            'b_lines': [         # items stored (mirror of what was received)
+                {'article': 'AROSR04', 'quantity': 10, 'pack_size': 1,
+                 'stock_type': 'STANDARD', 'lot': 'LTC001', 'expiry': '20300101',
+                 'quality': '1', 'line_state': '30'},
+            ],
+        },
+    ],
+}
+```
 
-| Code | ID | 32R msgs | Carriers | Description |
-|------|----|----------|----------|-------------|
-| 101 | `out_101_cbs_1art` | 1 | HU00001 | ARCBS01 from CBS (091) |
-| 102 | `out_102_cbs_osr_1carrier` | 2 | HU00001 | ARCBS01 CBS (091) + AROSR01 OSR (092), same carrier |
-| 103 | `out_103_partial_oos` | 1 | HU00001 | ARCBS01 OK + ARCBS02 out of stock (58) |
-| 104 | `out_104_3art_cbs` | 1 | HU00001 | 3 CBS articles, all state 30 |
-| 105 | `out_105_manual_osr_3msg` | 3 | HU00001 | ARM0011 M001 (001) + ARM0021 M002 (002) + AROSR01 OSR (092) |
-| 106 | `out_106_bulk_osr_2carriers` | 2 | HU00001+HU00002 | AR0001 Bulk(199) pack=12 + AR0002 OSR(092) pack=1 |
-| 107 | `out_107_mixed_2carriers` | 5 | HU00001+HU00002 | HU00001: Bulk(199); HU00002: CBS(091)+OSR(092)+M001(001)+M003(003) |
+**Current scenarios (9 outbound + 1 inbound):**
 
-**Pending scenarios to add:** physical inventory, replenishment, inbound goods-in, cancelled order,
-quantity mismatch, cooling/controlled substance station scenarios.
+| Code | Category | ID | 32R msgs | Carriers | Description |
+|------|----------|----|----------|----------|-------------|
+| 101 | OUT | `out_101_cbs_1art` | 2 | HU00001 | ARCBS01 from CBS (091) → FCS001 (093) |
+| 102 | OUT | `out_102_cbs_osr_1carrier` | 3 | HU00001 | CBS (091) + OSR (092) → FCS001 (093) |
+| 103 | OUT | `out_103_partial_oos` | 2 | HU00001 | ARCBS01 OK + ARCBS02 OOS (58) → FCS001 (093) |
+| 104 | OUT | `out_104_3art_cbs` | 2 | HU00001 | 3 CBS articles → FCS001 (093) |
+| 105 | OUT | `out_105_manual_osr` | 3 | HU00001 | Manual M001+M002 → RL002 (086) + OSR (092) → FCS001 (093) |
+| 106 | OUT | `out_106_bulk_osr_2carriers` | 3 | HU00001+HU00002 | Bulk (199) → OSR (092) → FCS001 (093) |
+| 107 | OUT | `out_107_mixed_2carriers` | 6 | HU00001+HU00002 | HU00001: Bulk (199); HU00002: CBS+OSR+Manual → FCS001 |
+| 108 | OUT | `out_108_cooling` | 2 | HU00001 | Cooling station (011) only → FCS001 (093) |
+| 109 | OUT | `out_109_controlled` | 2 | HU00001 | Controlled substance (010) only → FCS001 (093) |
+| IN-101 | IN | `in_101_osr_decanting` | 3 | HU00010+HU00011 (recv) / SU00001-SU00003 (stored) | 2× 12N → 3× 32R storage confirmations |
+
+**Pending scenarios to add:** physical inventory, replenishment, cancelled order, quantity mismatch,
+heartbeat scenarios.
 
 ---
 
@@ -863,7 +957,7 @@ A future Host client could be built several ways:
 
 ### What comes next
 
-1. **More scenarios** — physical inventory, replenishment, inbound (goods-in), cancelled order, cooling/controlled substance
+1. **More scenarios** — physical inventory, replenishment, cancelled order, quantity mismatch
 2. **Heartbeat** — `1HR` sent every 60s of silence on port 9801; mock sends `3HR` on 9802
 3. **Connection status badges** — per-port indicators in client header (connected / error)
 4. **Real KNAPP connection** — switch host to `89.207.120.100`, test against live system
@@ -885,3 +979,7 @@ A future Host client could be built several ways:
 | scan_state semantics inverted | Scenarios used `'0'` for passed; spec is `'1'`=passed | Corrected all scenario values; updated `_SCAN_STATE` labels |
 | `highest_sheet` wrong for multi-station single-carrier | Used `len(responses)` (counts 32R messages) instead of max sheet number | Changed to `max(r.get('sheet', 1) for r in responses)` |
 | Server crash on startup with stale `active_scenario.txt` | `_get_active_id()` returned an ID no longer in SCENARIOS; `ui.select` raised `ValueError: Invalid value` | Added validation: check stored ID against current scenario list; fall back to `SCENARIOS[0]` |
+| Inbound 12N triggered too many 32Rs | Server checked `scenario.get('category') == 'Inbound'` but an outbound scenario was selected, so condition was False and every 12N triggered immediately | Changed detection to use `order_type` from the parsed 12N (`if order_type in ('02','04','05')`) |
+| `_initial_preview` showed error string on startup | `_initial_preview` computed at module level before helper functions (`_friendly_article`, `_preview_text`) were defined; try/except caught NameError silently | Moved computation to after all helpers are defined |
+| Scenario Message Preview showed raw `msg.display()` | `send_scenario_order` was not updated when friendly formatters were added | Fixed outbound and inbound branches to use `_preview_text(_friendly_order(...), msg)` |
+| Inbound preview didn't distinguish multiple 12N packets | Used `msg.display()` per LU without context | Fixed with `═══` separators, `[1/N] HU000xx` suffix per block, and `— sending N × 12N —` header |

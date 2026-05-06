@@ -37,8 +37,10 @@ class OrderMessage(Message):
             r += '12' + pad_alpha(ln.get('article', ''), 12)
             r += '04' + pad_num(ln.get('pack_size', 0), 4)
             r += '08' + pad_alpha(ln.get('stock_type', 'STANDARD'), 8)
-            r += '00'  # lot
-            r += '00'  # expiry
+            lot = ln.get('lot', '')
+            r += ('20' + pad_alpha(lot, 20)) if lot else '00'
+            expiry = ln.get('expiry', '')
+            r += ('08' + pad_alpha(expiry, 8)) if expiry else '00'
             r += '00'  # reservation
             r += '04' + pad_num(ln.get('quantity', 0), 4)
             r += '01' + pad_alpha(ln.get('stock_quality', '1'), 1)

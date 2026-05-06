@@ -112,11 +112,167 @@ ctx: dict = {
 
 ui_queue: queue.Queue = queue.Queue()   # threads → GUI bridge
 
-# Pre-compute initial preview (no event loop needed at this point)
+_initial_preview = ''  # filled after helper functions are defined below
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Friendly preview formatters
+# ─────────────────────────────────────────────────────────────────────────────
+
+_OT_NAMES = {
+    '02': 'Transport (Open Shuttle)',
+    '04': 'Bulk goods-in / Decanting',
+    '05': 'Open goods-in',
+    '10': 'Outbound delivery',
+    '35': 'Withdrawal',
+    '36': 'Full carton dispatch',
+}
+
+def _friendly_order(s: dict, title_suffix: str = '') -> str:
+    ot        = str(s.get('order_type', '10'))
+    direction = 'Inbound' if ot in INBOUND_TYPES else 'Outbound'
+    L = [
+        f'12N — {direction} Order{title_suffix}',
+        '─' * 44,
+        f'  client        {str(s.get("client", "")).strip()}',
+        f'  order_number  {str(s.get("order_number", "")).strip()}',
+        f'  sheet         {int(s.get("sheet_number", 0)):04d}',
+        f'  order_type    {ot}  —  {_OT_NAMES.get(ot, ot)}',
+    ]
+    if ot in INBOUND_TYPES:
+        lcc = str(s.get('load_carrier_code', '')).strip()
+        if lcc:
+            L.append(f'  load_carrier  {lcc}')
+        stations = [st for st in s.get('dest_stations', []) if st]
+        if stations:
+            L.append(f'  dest_stations {",  ".join(stations)}')
+        b_lines = s.get('b_lines', [])
+        L += ['', f'  b  lines ({len(b_lines)}):']
+        for i, ln in enumerate(b_lines, 1):
+            if i > 1:
+                L.append('')
+            L += [
+                f'    [{i}]  article     {ln.get("article", "")}',
+                f'         station     {ln.get("station", "")}',
+                f'         pack_size   {ln.get("pack_size", 0)}',
+                f'         stock_type  {ln.get("stock_type", "")}',
+                f'         quantity    {ln.get("quantity", 0)}',
+            ]
+            if ln.get('lot'):
+                L.append(f'         lot         {ln["lot"]}')
+            if ln.get('expiry'):
+                L.append(f'         expiry      {ln["expiry"]}')
+            L.append(f'         quality     {ln.get("stock_quality", "1")}')
+    else:
+        L.append(f'  carrier_type  {s.get("carrier_type", "LARGE")}')
+        pn = str(s.get('partner_number', '')).strip()
+        if pn:
+            L.append(f'  partner       {pn}')
+        rn = str(s.get('route_number', '')).strip()
+        if rn:
+            L.append(f'  route         {rn}')
+        L.append(f'  priority      {int(s.get("priority", 0)):03d}')
+        params = [p for p in s.get('control_params', []) if p]
+        if params:
+            L.append(f'  control       {",  ".join(params)}')
+        z_lines = s.get('z_lines', [])
+        L += ['', f'  Z  lines ({len(z_lines)}):']
+        for i, ln in enumerate(z_lines, 1):
+            if i > 1:
+                L.append('')
+            L += [
+                f'    [{i}]  article     {ln.get("article", "")}',
+                f'         stock_type  {ln.get("stock_type", "")}',
+                f'         quantity    {ln.get("quantity", 0)}',
+            ]
+    return '\n'.join(L)
+
+
+def _friendly_article(s: dict) -> str:
+    L = [
+        f'14N — Article Master Data  [{s.get("mode", "recreate")}]',
+        '─' * 44,
+        f'  station       {s.get("station", "")}',
+        f'  client        {str(s.get("client", "")).strip()}',
+        f'  article       {str(s.get("article_number", "")).strip()}',
+        f'  pack_size     {s.get("pack_size", 0)}',
+        f'  ejection_#    {s.get("ejection_number", 0)}',
+        f'  max_qty       {s.get("max_quantity", 0)}',
+        f'  dimensions    L {s.get("length_mm", 0)}  W {s.get("width_mm", 0)}  H {s.get("height_mm", 0)}  mm',
+        f'  weight        {s.get("weight", 0)} × 0.1 g',
+        f'  article_name  {str(s.get("article_name", "")).strip()}',
+        f'  geocode       {str(s.get("geocode", "")).strip()}',
+        f'  stock         min {s.get("min_stock", 0)}  max {s.get("max_stock", 0)}',
+    ]
+    chars = [c for c in ['ROBOT_TREATABLE', 'COOLING_REQUIRED', 'CONTROLLED', 'UNMARKED']
+             if s.get(f'char_{c}')]
+    if chars:
+        L.append(f'  chars         {",  ".join(chars)}')
+    props = [lbl for code, lbl in [('01', 'lot req'), ('02', 'expiry req'), ('03', 'serial req')]
+             if s.get(f'prop_{code}')]
+    if props:
+        L.append(f'  properties    {",  ".join(props)}')
+    bcs = [bc for bc in s.get('barcodes', []) if bc]
+    if bcs:
+        L.append(f'  barcodes ({len(bcs)}):')
+        for bc in bcs:
+            L.append(f'    {bc}')
+    repl = str(s.get('repl_station', '')).strip()
+    if repl:
+        L += [f'  repl_station  {repl}',
+              f'  repl_geocode  {str(s.get("repl_geocode", "")).strip()}']
+    return '\n'.join(L)
+
+
+def _friendly_partner(s: dict) -> str:
+    first = str(s.get('first_name', '')).strip()
+    last  = str(s.get('last_name',  '')).strip()
+    treat = str(s.get('treatment',  '')).strip()
+    name  = ' '.join(p for p in [treat, first, last] if p)
+    L = [
+        f'15N — Partner Master Data  [{s.get("mode", "recreate")}]',
+        '─' * 44,
+        f'  client        {str(s.get("client", "")).strip()}',
+        f'  partner       {str(s.get("partner_number", "")).strip()}',
+        f'  company       {str(s.get("company", "")).strip()}',
+        f'  name          {name}',
+        f'  street        {str(s.get("street", "")).strip()}',
+        f'  city          {str(s.get("zip_code", "")).strip()} {str(s.get("city", "")).strip()}',
+        f'  region        {str(s.get("region", "")).strip()}',
+        f'  country       {str(s.get("country_code", "")).strip()}',
+        f'  email         {str(s.get("email", "")).strip()}',
+        f'  phone         {str(s.get("phone", "")).strip()}',
+    ]
+    return '\n'.join(L)
+
+
+def _friendly_route(s: dict) -> str:
+    L = [
+        f'16N — Theoretical Route  [{s.get("mode", "recreate")}]',
+        '─' * 44,
+        f'  client        {str(s.get("client", "")).strip()}',
+        f'  route_number  {str(s.get("route_number", "")).strip()}',
+        f'  departure     {str(s.get("departure_time", "")).strip()}',
+        f'  availability  {str(s.get("availability_time", "")).strip()}',
+        f'  day_of_week   {s.get("day_of_week", "") or "(none)"}',
+    ]
+    ramps = [r for r in s.get('ramps', []) if r]
+    L.append(f'  ramps ({len(ramps)}):')
+    for rp in ramps:
+        L.append(f'    {rp}')
+    return '\n'.join(L)
+
+
+def _preview_text(friendly: str, msg) -> str:
+    divider = '·' * 44
+    return f'{friendly}\n\n{divider}\n\n{msg.display()}'
+
+
 try:
-    _initial_preview = ArticleMessage(art).display()
+    _msg0 = ArticleMessage(art)
+    _initial_preview = _preview_text(_friendly_article(art), _msg0)
 except Exception as _e:
     _initial_preview = str(_e)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Preview helpers
@@ -130,6 +286,7 @@ def _get_scenario(sc_id: str) -> dict:
 
 
 def _build_order_from_scenario(sc: dict, client: str, order_number: str) -> dict:
+    """Build a single outbound 12N from a scenario (deduplicates Z-lines)."""
     z_lines, seen = [], set()
     for resp in sc.get('responses', []):
         for ln in resp.get('z_lines', []):
@@ -151,6 +308,22 @@ def _build_order_from_scenario(sc: dict, client: str, order_number: str) -> dict
     }
 
 
+def _build_inbound_12n(lu: dict, client: str, order_number: str) -> dict:
+    """Build one inbound 12N from a loading_unit entry."""
+    stations = list({ln.get('station', '065') for ln in lu.get('b_lines', [])})
+    return {
+        'client':            client,
+        'order_number':      order_number,
+        'sheet_number':      0,
+        'order_type':        '04',
+        'load_carrier_code': lu['carrier_code'],
+        'dest_stations':     stations,
+        'b_lines':           lu.get('b_lines', []),
+        'carrier_type': 'LARGE', 'partner_number': '', 'route_number': '',
+        'priority': 0, 'control_params': [], 'z_lines': [],
+    }
+
+
 def _set_preview(text: str) -> None:
     el = ctx['preview_el']
     if el is not None:
@@ -160,15 +333,35 @@ def _set_preview(text: str) -> None:
 def refresh_preview() -> None:
     try:
         tab = ctx['tab']
-        if tab == 'article':    msg = ArticleMessage(art)
-        elif tab == 'partner':  msg = PartnerMessage(prt)
-        elif tab == 'order':    msg = OrderMessage(order)
+        if tab == 'article':
+            msg = ArticleMessage(art)
+            _set_preview(_preview_text(_friendly_article(art), msg))
+        elif tab == 'partner':
+            msg = PartnerMessage(prt)
+            _set_preview(_preview_text(_friendly_partner(prt), msg))
+        elif tab == 'route':
+            msg = RouteMessage(rte)
+            _set_preview(_preview_text(_friendly_route(rte), msg))
+        elif tab == 'order':
+            msg = OrderMessage(order)
+            _set_preview(_preview_text(_friendly_order(order), msg))
         elif tab == 'scenario':
-            od  = _build_order_from_scenario(
-                _get_scenario(scen['scenario_id']), scen['client'], scen['order_number'])
-            msg = OrderMessage(od)
-        else:                   msg = RouteMessage(rte)
-        _set_preview(msg.display())
+            sc = _get_scenario(scen['scenario_id'])
+            if sc.get('category') == 'Inbound':
+                lus = sc.get('loading_units', [])
+                if not lus:
+                    _set_preview('No loading units defined')
+                    return
+                n   = len(lus)
+                od  = _build_inbound_12n(lus[0], scen['client'], scen['order_number'])
+                msg = OrderMessage(od)
+                suf = f'  [1/{n}]  {lus[0]["carrier_code"]}' if n > 1 else ''
+                hdr = f'— {n} × 12N will be sent —\n\n' if n > 1 else ''
+                _set_preview(hdr + _preview_text(_friendly_order(od, suf), msg))
+            else:
+                od  = _build_order_from_scenario(sc, scen['client'], scen['order_number'])
+                msg = OrderMessage(od)
+                _set_preview(_preview_text(_friendly_order(od), msg))
     except Exception as exc:
         _set_preview(f'Error building message:\n{exc}')
 
@@ -182,7 +375,7 @@ def _enqueue(*packets) -> None:
 def send_article() -> None:
     try:
         tx = ArticleTransmission(art.get('mode', 'recreate'), art)
-        _set_preview(tx.display())
+        _set_preview(_preview_text(_friendly_article(art), tx.data_msg) + '\n\n' + tx.display())
         _enqueue(tx.open_msg.packet, tx.data_msg.packet, tx.close_msg.packet)
     except Exception as exc:
         _set_preview(f'Error building transmission:\n{exc}')
@@ -190,7 +383,7 @@ def send_article() -> None:
 def send_partner() -> None:
     try:
         tx = PartnerTransmission(prt.get('mode', 'recreate'), prt)
-        _set_preview(tx.display())
+        _set_preview(_preview_text(_friendly_partner(prt), tx.data_msg) + '\n\n' + tx.display())
         _enqueue(tx.open_msg.packet, tx.data_msg.packet, tx.close_msg.packet)
     except Exception as exc:
         _set_preview(f'Error building transmission:\n{exc}')
@@ -198,25 +391,40 @@ def send_partner() -> None:
 def send_route() -> None:
     try:
         tx = RouteTransmission(rte.get('mode', 'recreate'), rte)
-        _set_preview(tx.display())
+        _set_preview(_preview_text(_friendly_route(rte), tx.data_msg) + '\n\n' + tx.display())
         _enqueue(tx.open_msg.packet, tx.data_msg.packet, tx.close_msg.packet)
     except Exception as exc:
         _set_preview(f'Error building transmission:\n{exc}')
 
 def send_scenario_order() -> None:
     try:
-        od  = _build_order_from_scenario(
-            _get_scenario(scen['scenario_id']), scen['client'], scen['order_number'])
-        msg = OrderMessage(od)
-        _set_preview(msg.display())
-        _enqueue(msg.packet)
+        sc = _get_scenario(scen['scenario_id'])
+        if sc.get('category') == 'Inbound':
+            lus = sc.get('loading_units', [])
+            packets, previews = [], []
+            n = len(lus)
+            for i, lu in enumerate(lus, 1):
+                od  = _build_inbound_12n(lu, scen['client'], scen['order_number'])
+                msg = OrderMessage(od)
+                packets.append(msg.packet)
+                suf = f'  [{i}/{n}]  {lu["carrier_code"]}' if n > 1 else f'  {lu["carrier_code"]}'
+                previews.append(_preview_text(_friendly_order(od, suf), msg))
+            sep = '\n\n' + '═' * 44 + '\n\n'
+            hdr = f'— sending {n} × 12N —\n\n' if n > 1 else ''
+            _set_preview(hdr + sep.join(previews))
+            _enqueue(*packets)
+        else:
+            od  = _build_order_from_scenario(sc, scen['client'], scen['order_number'])
+            msg = OrderMessage(od)
+            _set_preview(_preview_text(_friendly_order(od), msg))
+            _enqueue(msg.packet)
     except Exception as exc:
         _set_preview(f'Error building scenario order:\n{exc}')
 
 def send_order() -> None:
     try:
         msg = OrderMessage(order)
-        _set_preview(msg.display())
+        _set_preview(_preview_text(_friendly_order(order), msg))
         _enqueue(msg.packet)
     except Exception as exc:
         _set_preview(f'Error building message:\n{exc}')
@@ -403,47 +611,98 @@ def direction_section() -> None:
 
 @ui.refreshable
 def scenario_tab_content() -> None:
-    sc = _get_scenario(scen['scenario_id'])
-    ui.label(sc['name']).classes('text-subtitle2 text-bold text-blue-3')
+    sc  = _get_scenario(scen['scenario_id'])
+    cat = sc.get('category', 'Outbound')
+
+    with ui.row().classes('items-center gap-2 q-mb-xs'):
+        ui.badge(cat).props(f'color={"orange" if cat == "Outbound" else "blue"}')
+        ui.label(sc['name']).classes('text-subtitle2 text-bold text-blue-3')
     ui.label(sc.get('description', '')).classes('text-caption text-grey-4 q-mb-sm')
     ui.separator().classes('q-my-sm')
 
-    ui.label('Responses').classes('text-caption text-grey-5 q-mb-xs')
-    for resp in sc.get('responses', []):
-        stn       = resp.get('last_scan_station', '')
-        stn_lbl   = STATION_LABELS.get(stn, '')
-        states_txt = '  ·  '.join(ORDER_STATE_LABELS.get(s, s) for s in resp.get('order_states', []))
-        with ui.card().classes('bg-grey-8 no-shadow q-pa-sm q-mb-xs w-full'):
-            with ui.row().classes('items-center gap-3 q-mb-xs'):
-                ui.badge(f'Sheet {resp["sheet"]}').props('color=blue-grey')
-                ui.badge(f'{stn} — {stn_lbl}' if stn_lbl else stn).props('color=teal')
-                ui.badge(resp.get('carrier_type', 'LARGE')).props('color=purple')
-                ui.label(states_txt).classes('text-caption text-grey-4')
-            for ln in resp.get('z_lines', []):
-                state = str(ln.get('line_state', '30'))
-                color = 'positive' if state == '30' else 'negative'
-                with ui.row().classes('items-center gap-2 q-mt-xs flex-wrap'):
-                    ui.badge(state).props(f'color={color}')
-                    ui.label(ln.get('article', '')).classes('font-mono text-caption')
-                    ui.label(f'qty {ln.get("quantity", 0)}').classes('text-caption text-grey-3')
-                    ui.label(ln.get('stock_type', '')).classes('text-caption text-grey-5')
-                    if ln.get('lot'):
-                        ui.label(f'lot {ln["lot"]}').classes('text-caption text-orange-4')
-                    if ln.get('geocode'):
-                        ui.label(f'geo {ln["geocode"]}').classes('text-caption text-teal-4')
+    if cat == 'Inbound':
+        # ── Loading units ─────────────────────────────────────────────────────
+        lus = sc.get('loading_units', [])
+        ui.label(f'Loading Units → {len(lus)} × 12N will be sent').classes('text-caption text-grey-5 q-mb-xs')
+        for lu in lus:
+            with ui.card().classes('bg-grey-8 no-shadow q-pa-sm q-mb-xs w-full'):
+                with ui.row().classes('items-center gap-3 q-mb-xs'):
+                    ui.badge(lu['carrier_code']).props('color=deep-orange')
+                    ui.label('order_type 04 — Decanting').classes('text-caption text-grey-5')
+                for ln in lu.get('b_lines', []):
+                    with ui.row().classes('items-center gap-2 q-mt-xs flex-wrap'):
+                        ui.label(ln.get('article', '')).classes('font-mono text-caption text-white')
+                        ui.label(f'qty {ln.get("quantity", 0)}').classes('text-caption text-grey-3')
+                        ui.label(f'st {ln.get("station", "")}').classes('text-caption text-grey-5')
+                        if ln.get('lot'):
+                            ui.label(f'lot {ln["lot"]}').classes('text-caption text-orange-4')
+                        if ln.get('expiry'):
+                            ui.label(f'exp {ln["expiry"]}').classes('text-caption text-teal-4')
 
-    ui.separator().classes('q-my-sm')
-    ui.label('12N that will be sent').classes('text-caption text-grey-5 q-mb-xs')
-    od = _build_order_from_scenario(sc, scen['client'], scen['order_number'])
-    ui.label(
-        f'Type 10 — Outbound delivery  ·  Carrier: {od["carrier_type"]}'
-    ).classes('text-caption text-grey-3')
-    for i, ln in enumerate(od.get('z_lines', []), 1):
+        ui.separator().classes('q-my-sm')
+
+        # ── Expected responses ────────────────────────────────────────────────
+        resps = sc.get('responses', [])
+        ui.label(f'Expected Responses → {len(resps)} × 32R from KiSoft').classes('text-caption text-grey-5 q-mb-xs')
+        for resp in resps:
+            stn     = resp.get('last_scan_station', '')
+            stn_lbl = STATION_LABELS.get(stn, '')
+            states_txt = '  ·  '.join(ORDER_STATE_LABELS.get(s, s) for s in resp.get('order_states', []))
+            with ui.card().classes('bg-grey-8 no-shadow q-pa-sm q-mb-xs w-full'):
+                with ui.row().classes('items-center gap-3 q-mb-xs'):
+                    ui.badge(resp.get('carrier_code', '')).props('color=blue-grey')
+                    ui.badge(f'{stn} — {stn_lbl}' if stn_lbl else stn).props('color=teal')
+                    ui.label(states_txt).classes('text-caption text-grey-4')
+                for ln in resp.get('b_lines', []):
+                    state = str(ln.get('line_state', '30'))
+                    color = 'positive' if state == '30' else 'negative'
+                    with ui.row().classes('items-center gap-2 q-mt-xs flex-wrap'):
+                        ui.badge(state).props(f'color={color}')
+                        ui.label(ln.get('article', '')).classes('font-mono text-caption')
+                        ui.label(f'qty {ln.get("quantity", 0)}').classes('text-caption text-grey-3')
+                        if ln.get('lot'):
+                            ui.label(f'lot {ln["lot"]}').classes('text-caption text-orange-4')
+                        if ln.get('expiry'):
+                            ui.label(f'exp {ln["expiry"]}').classes('text-caption text-teal-4')
+
+    else:
+        # ── Outbound: responses (32R) ─────────────────────────────────────────
+        ui.label('Responses').classes('text-caption text-grey-5 q-mb-xs')
+        for resp in sc.get('responses', []):
+            stn       = resp.get('last_scan_station', '')
+            stn_lbl   = STATION_LABELS.get(stn, '')
+            states_txt = '  ·  '.join(ORDER_STATE_LABELS.get(s, s) for s in resp.get('order_states', []))
+            with ui.card().classes('bg-grey-8 no-shadow q-pa-sm q-mb-xs w-full'):
+                with ui.row().classes('items-center gap-3 q-mb-xs'):
+                    ui.badge(f'Sheet {resp["sheet"]}').props('color=blue-grey')
+                    ui.badge(f'{stn} — {stn_lbl}' if stn_lbl else stn).props('color=teal')
+                    ui.badge(resp.get('carrier_type', 'LARGE')).props('color=purple')
+                    ui.label(states_txt).classes('text-caption text-grey-4')
+                for ln in resp.get('z_lines', []):
+                    state = str(ln.get('line_state', '30'))
+                    color = 'positive' if state == '30' else 'negative'
+                    with ui.row().classes('items-center gap-2 q-mt-xs flex-wrap'):
+                        ui.badge(state).props(f'color={color}')
+                        ui.label(ln.get('article', '')).classes('font-mono text-caption')
+                        ui.label(f'qty {ln.get("quantity", 0)}').classes('text-caption text-grey-3')
+                        ui.label(ln.get('stock_type', '')).classes('text-caption text-grey-5')
+                        if ln.get('lot'):
+                            ui.label(f'lot {ln["lot"]}').classes('text-caption text-orange-4')
+                        if ln.get('geocode'):
+                            ui.label(f'geo {ln["geocode"]}').classes('text-caption text-teal-4')
+
+        ui.separator().classes('q-my-sm')
+        ui.label('12N that will be sent').classes('text-caption text-grey-5 q-mb-xs')
+        od = _build_order_from_scenario(sc, scen['client'], scen['order_number'])
         ui.label(
-            f'  {i}.  {ln["article"]}   qty {ln["quantity"]}   {ln["stock_type"]}'
-        ).classes('font-mono text-caption text-grey-3 q-mt-xs')
-    if not od.get('z_lines'):
-        ui.label('No lines').classes('text-caption text-grey-6')
+            f'Type 10 — Outbound delivery  ·  Carrier: {od["carrier_type"]}'
+        ).classes('text-caption text-grey-3')
+        for i, ln in enumerate(od.get('z_lines', []), 1):
+            ui.label(
+                f'  {i}.  {ln["article"]}   qty {ln["quantity"]}   {ln["stock_type"]}'
+            ).classes('font-mono text-caption text-grey-3 q-mt-xs')
+        if not od.get('z_lines'):
+            ui.label('No lines').classes('text-caption text-grey-6')
 
 
 def preview_area() -> None:
@@ -460,15 +719,16 @@ def received_area() -> None:
     ctx['received_el'] = el
 
 
-def append_received(text: str) -> None:
+def append_received(text: str, port: str = '') -> None:
     from datetime import datetime
     el = ctx['received_el']
     if el is None:
         return
-    ts  = datetime.now().strftime('%H:%M:%S')
-    sep = '─' * 44
-    entry   = f'[{ts}]\n{text}'
-    current = el.value or ''
+    ts       = datetime.now().strftime('%H:%M:%S')
+    sep      = '─' * 44
+    port_tag = f'  ←  PORT {port}' if port else ''
+    entry    = f'[{ts}]{port_tag}\n{text}'
+    current  = el.value or ''
     el.value = entry + ('\n\n' + sep + '\n\n' + current if current else '')
     el.update()
 
@@ -704,8 +964,11 @@ with ui.splitter(value=58).classes('w-full h-screen') as sp:
                             scenario_tab_content.refresh()
                             refresh_preview()
 
+                        def _sc_label(sc):
+                            tag = '[OUT]' if sc['category'] == 'Outbound' else '[IN] '
+                            return f'{tag}  {sc["name"]}'
                         ui.select(
-                            {sc['id']: f'[{sc["category"]}]  {sc["name"]}' for sc in SCENARIOS},
+                            {sc['id']: _sc_label(sc) for sc in SCENARIOS},
                             value=scen['scenario_id'],
                             label='Scenario',
                             on_change=_on_scen_sel,

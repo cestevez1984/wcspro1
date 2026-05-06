@@ -102,4 +102,19 @@ class OrderResponseMessage(Message):
             else:
                 rec += '00'  # geocode (empty)
 
+        # b — storage lines (inbound)
+        b_lines = r.get('b_lines', [])
+        rec += 'b' + f'{len(b_lines):02d}'
+        for ln in b_lines:
+            rec += '12' + pad_alpha(ln.get('article', ''), 12)
+            rec += '04' + pad_num(ln.get('pack_size', 1), 4)
+            rec += '08' + pad_alpha(ln.get('stock_type', 'STANDARD'), 8)
+            lot = ln.get('lot', '')
+            rec += ('20' + pad_alpha(lot, 20)) if lot else '00'
+            expiry = ln.get('expiry', '')
+            rec += ('08' + pad_alpha(expiry, 8)) if expiry else '00'
+            rec += '04' + pad_num(ln.get('quantity', 0), 4)
+            rec += '01' + pad_alpha(ln.get('quality', '1'), 1)
+            rec += '02' + pad_alpha(str(ln.get('line_state', '30')), 2)
+
         return rec

@@ -54,8 +54,9 @@ if not SCENARIO_FILE.exists():       # only initialise on first run; preserve ac
 # Shared state
 # ─────────────────────────────────────────────────────────────────────────────
 
-ui_queue      = queue.Queue()   # threads → GUI
-trigger_queue = queue.Queue()   # 9801 thread → 9802 thread (order_info)
+ui_queue        = queue.Queue()   # threads → GUI
+trigger_queue   = queue.Queue()   # 9801 thread → 9802 thread (order_info)
+_inbound_buffer = {}              # {order_number: count_received} for inbound accumulation
 
 ctx = {
     'log_el':        None,
@@ -108,8 +109,22 @@ def server_thread_9801() -> None:
 
                                 if record_id == '12N':
                                     order_info = parse_12n(data)
-                                    trigger_queue.put(order_info)
-                                    _log(f'   queued for scenario: {_get_selected()["name"]}')
+                                    order_type = order_info.get('order_type', '10')
+                                    scenario   = _get_selected()
+                                    if order_type in ('02', '04', '05'):
+                                        # Inbound — accumulate all loading units before triggering
+                                        key      = order_info['order_number']
+                                        expected = len(scenario.get('loading_units', [])) or 1
+                                        _inbound_buffer[key] = _inbound_buffer.get(key, 0) + 1
+                                        got = _inbound_buffer[key]
+                                        _log(f'   inbound LU {got}/{expected}  ({key})')
+                                        if got >= expected:
+                                            trigger_queue.put(order_info)
+                                            del _inbound_buffer[key]
+                                            _log(f'   → all LUs received, queued: {scenario["name"]}')
+                                    else:
+                                        trigger_queue.put(order_info)
+                                        _log(f'   queued for scenario: {scenario["name"]}')
 
                             except socket.timeout:
                                 pass  # keep connection alive, wait for next message
@@ -242,29 +257,73 @@ def _get_selected() -> dict:
 @ui.refreshable
 def scenario_detail() -> None:
     sc = _get_selected()
-    ui.label(sc['name']).classes('text-subtitle1 text-bold text-blue-3')
+    cat = sc.get('category', 'Outbound')
+    cat_color = 'orange-4' if cat == 'Outbound' else 'blue-4'
+    with ui.row().classes('items-center gap-2 q-mb-xs'):
+        ui.badge(cat).props(f'color={"orange" if cat == "Outbound" else "blue"}')
+        ui.label(sc['name']).classes('text-subtitle1 text-bold text-blue-3')
     ui.label(sc['description']).classes('text-caption text-grey-4 q-mb-sm')
     ui.separator()
 
-    for resp in sc['responses']:
-        states_text = '  ·  '.join(
-            ORDER_STATE_LABELS.get(s, s) for s in resp['order_states']
-        )
-        with ui.card().classes('bg-grey-8 no-shadow q-pa-sm q-mb-sm w-full'):
-            with ui.row().classes('items-center gap-4 q-mb-xs'):
-                ui.badge(f'Sheet {resp["sheet"]}').props('color=blue-grey')
-                ui.badge(f'Station {resp["last_scan_station"]}').props('color=teal')
-                ui.badge(resp['carrier_type']).props('color=purple')
-                ui.label(states_text).classes('text-caption text-grey-4')
+    if cat == 'Inbound':
+        # ── Loading units (12N messages the client will send) ─────────────────
+        ui.label('Loading Units (12N × sent)').classes('text-caption text-grey-5 q-mt-xs q-mb-xs')
+        for lu in sc.get('loading_units', []):
+            with ui.card().classes('bg-grey-8 no-shadow q-pa-sm q-mb-sm w-full'):
+                with ui.row().classes('items-center gap-3 q-mb-xs'):
+                    ui.badge(lu['carrier_code']).props('color=deep-orange')
+                    ui.label('12N  order_type 04').classes('text-caption text-grey-5')
+                for ln in lu.get('b_lines', []):
+                    with ui.row().classes('items-center gap-3 q-mt-xs'):
+                        ui.label(ln['article']).classes('font-mono text-caption text-white')
+                        ui.label(f'qty {ln["quantity"]}').classes('text-caption text-grey-3')
+                        if ln.get('lot'):
+                            ui.label(f'lot {ln["lot"]}').classes('text-caption text-orange-4')
+                        if ln.get('expiry'):
+                            ui.label(f'exp {ln["expiry"]}').classes('text-caption text-teal-4')
 
-            for ln in resp['z_lines']:
-                state_label = LINE_STATE_LABELS.get(str(ln['line_state']), str(ln['line_state']))
-                color = 'positive' if str(ln['line_state']) == '30' else 'negative'
-                with ui.row().classes('items-center gap-3 q-mt-xs'):
-                    ui.badge(state_label).props(f'color={color}')
-                    ui.label(ln['article']).classes('font-mono text-caption')
-                    ui.label(f'qty {ln["quantity"]}').classes('text-caption text-grey-3')
-                    ui.label(ln['stock_type']).classes('text-caption text-grey-5')
+        ui.separator().classes('q-my-sm')
+
+        # ── Storage unit responses (32R KiSoft will send back) ────────────────
+        ui.label('Storage Units (32R × received)').classes('text-caption text-grey-5 q-mb-xs')
+        for resp in sc.get('responses', []):
+            states_text = '  ·  '.join(ORDER_STATE_LABELS.get(s, s) for s in resp.get('order_states', []))
+            with ui.card().classes('bg-grey-8 no-shadow q-pa-sm q-mb-sm w-full'):
+                with ui.row().classes('items-center gap-4 q-mb-xs'):
+                    ui.badge(resp['carrier_code']).props('color=blue-grey')
+                    ui.badge(f'Station {resp["last_scan_station"]}').props('color=teal')
+                    ui.label(states_text).classes('text-caption text-grey-4')
+                for ln in resp.get('b_lines', []):
+                    state_label = LINE_STATE_LABELS.get(str(ln['line_state']), str(ln['line_state']))
+                    color = 'positive' if str(ln['line_state']) == '30' else 'negative'
+                    with ui.row().classes('items-center gap-3 q-mt-xs'):
+                        ui.badge(state_label).props(f'color={color}')
+                        ui.label(ln['article']).classes('font-mono text-caption')
+                        ui.label(f'qty {ln["quantity"]}').classes('text-caption text-grey-3')
+                        if ln.get('lot'):
+                            ui.label(f'lot {ln["lot"]}').classes('text-caption text-orange-4')
+
+    else:
+        # ── Outbound: existing response display ───────────────────────────────
+        for resp in sc.get('responses', []):
+            states_text = '  ·  '.join(
+                ORDER_STATE_LABELS.get(s, s) for s in resp.get('order_states', [])
+            )
+            with ui.card().classes('bg-grey-8 no-shadow q-pa-sm q-mb-sm w-full'):
+                with ui.row().classes('items-center gap-4 q-mb-xs'):
+                    ui.badge(f'Sheet {resp["sheet"]}').props('color=blue-grey')
+                    ui.badge(f'Station {resp["last_scan_station"]}').props('color=teal')
+                    ui.badge(resp.get('carrier_type', '')).props('color=purple')
+                    ui.label(states_text).classes('text-caption text-grey-4')
+
+                for ln in resp.get('z_lines', []):
+                    state_label = LINE_STATE_LABELS.get(str(ln['line_state']), str(ln['line_state']))
+                    color = 'positive' if str(ln['line_state']) == '30' else 'negative'
+                    with ui.row().classes('items-center gap-3 q-mt-xs'):
+                        ui.badge(state_label).props(f'color={color}')
+                        ui.label(ln['article']).classes('font-mono text-caption')
+                        ui.label(f'qty {ln["quantity"]}').classes('text-caption text-grey-3')
+                        ui.label(ln['stock_type']).classes('text-caption text-grey-5')
 
 
 @ui.refreshable
@@ -323,7 +382,7 @@ with ui.splitter(value=35).classes('w-full').style('height: calc(100vh - 55px)')
                 scenario_detail.refresh()
 
             ui.select(
-                {sc['id']: sc['name'] for sc in SCENARIOS},
+                {sc['id']: ('[OUT]' if sc['category'] == 'Outbound' else '[IN] ') + '  ' + sc['name'] for sc in SCENARIOS},
                 value=_get_active_id(),
                 label='Active Scenario',
                 on_change=_on_select,
